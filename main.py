@@ -83,7 +83,7 @@ class EducationalAudioPipeline:
             "output_dir": Path("output"),
             "temp_dir": Path("temp"),
             "models_dir": Path("models"),
-            "educational_mode": True,
+            "educational_mode": False,
             "verbose": True,
             "save_intermediates": True,
             "visualization": True,
@@ -597,6 +597,9 @@ def main():
         },
         "deepseek": {
             "api_key": args.deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY"),
+            "model": "deepseek-chat",
+            "temperature": 0.7,
+            "max_tokens": 2048,
         }
     }
 

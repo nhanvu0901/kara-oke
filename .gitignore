@@ -81,3 +81,5 @@ ehthumbs_vista.db
 *.bak
 *.tmp
 *.log
+/output
+/song

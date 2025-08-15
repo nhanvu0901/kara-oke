@@ -5,7 +5,6 @@ import logging
 
 # Import AudioCraft components (requires: pip install audiocraft)
 
-
 logger = logging.getLogger(__name__)
 try:
     from audiocraft.models import MusicGen, AudioGen
@@ -37,14 +36,16 @@ class AudioCraftProcessor:
                 if "musicgen" in model_name and not model_name.startswith("facebook/"):
                     model_name = f"facebook/{model_name}"
                 logger.info(f"Loading MusicGen model: {model_name}")
-                self.model = MusicGen.get_pretrained(model_name)
+                # MusicGen handles device placement internally
+                # The device parameter can be passed during model loading
+                self.model = MusicGen.get_pretrained(model_name, device=self.device)
             elif "audiogen" in model_name:
                 logger.info(f"Loading AudioGen model: {model_name}")
-                self.model = AudioGen.get_pretrained(model_name)
+                self.model = AudioGen.get_pretrained(model_name, device=self.device)
             else:
                 raise ValueError(f"Unknown AudioCraft model: {model_name}")
 
-            self.model.to(self.device)
+
             logger.info(f"AudioCraft model loaded on {self.device}")
 
         except Exception as e:
@@ -97,6 +98,12 @@ class AudioCraftProcessor:
                 # Prepare audio for model
                 if waveform.dim() == 2:
                     waveform = waveform.unsqueeze(0)  # Add batch dimension
+                elif waveform.dim() == 1:
+                    waveform = waveform.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+
+                # Ensure waveform is on the correct device
+                if hasattr(self.model, 'device'):
+                    waveform = waveform.to(self.model.device)
 
                 with torch.no_grad():
                     continued = self.model.generate_continuation(
@@ -110,19 +117,41 @@ class AudioCraftProcessor:
             else:  # enhance mode
                 # Process/enhance existing audio
                 # This is a simplified example - actual enhancement would be more complex
+                # For now, just return the original audio
+                # In a real implementation, you might use AudioGen or other processing
                 output_audio = waveform
+                logger.info("Enhancement mode is a placeholder - returning original audio")
+
+            # Get the sample rate from the model if available
+            if hasattr(self.model, 'sample_rate'):
+                output_sample_rate = self.model.sample_rate
+            elif hasattr(self.model, 'compression_model') and hasattr(self.model.compression_model, 'sample_rate'):
+                output_sample_rate = self.model.compression_model.sample_rate
+            else:
+                output_sample_rate = sample_rate
 
             return {
                 "audio": output_audio,
-                "sample_rate": self.model.sample_rate if hasattr(self.model, 'sample_rate') else sample_rate,
+                "sample_rate": output_sample_rate,
                 "mode": mode,
                 "prompt": prompt,
                 "metrics": {
                     "model": self.config["audiocraft"]["model"],
-                    "duration": float(output_audio.shape[-1] / sample_rate)
+                    "duration": float(output_audio.shape[-1] / output_sample_rate)
                 }
             }
 
         except Exception as e:
             logger.error(f"AudioCraft processing failed: {e}")
-            raise
+            # Return original audio as fallback
+            logger.warning("Returning original audio as fallback")
+            return {
+                "audio": waveform,
+                "sample_rate": sample_rate,
+                "mode": mode,
+                "prompt": prompt,
+                "metrics": {
+                    "model": self.config["audiocraft"]["model"],
+                    "error": str(e)
+                }
+            }
