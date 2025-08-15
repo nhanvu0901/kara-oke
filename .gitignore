@@ -1,0 +1,83 @@
+# This file is used to ignore common files and directories
+# that are generated during a Python project's lifecycle.
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.coverage
+.tox/
+.pytest_cache/
+htmlcov/
+.nox/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDEs and editors
+# VS Code
+.vscode/
+# PyCharm
+.idea/
+# Sublime
+*.sublime-project
+*.sublime-workspace
+# Eclipse
+.project
+.pydevproject
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+
+# Project-specific files that may contain sensitive data
+# e.g., configuration files with API keys
+# If you have specific files, add them here
+# config.ini
+# .env.local
+
+# Database files
+*.sqlite
+*.db
+
+# Temporary files
+*.swp
+*.bak
+*.tmp
+*.log
