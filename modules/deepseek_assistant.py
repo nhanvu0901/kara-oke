@@ -2,6 +2,7 @@ import requests
 from typing import Dict, Optional
 import logging
 import json
+
 logger = logging.getLogger(__name__)
 
 
@@ -99,6 +100,7 @@ class DeepSeekAssistant:
 
     def classify_instruments(self, features: Dict) -> Dict:
         """Classify instruments and suggest separation strategy."""
+        # Use double curly braces to escape them in the string
         prompt = f"""
         Analyze these audio features and identify likely instruments:
 
@@ -117,12 +119,26 @@ class DeepSeekAssistant:
         3. Recommend separation strategy (models/techniques)
 
         Return as JSON with structure:
-        {
-        "instruments": [{"name": "piano", "confidence": 0.8, "freq_range": [27, 4186]}],
+        {{
+            "instruments": [{{"name": "piano", "confidence": 0.8, "freq_range": [27, 4186]}}],
             "separation_strategy": "..."
-        }
+        }}
         """
 
         response = self._query(prompt)
         # Parse JSON response
-        return json.loads(response) if response else {}
+        try:
+            if response:
+                return json.loads(response)
+            else:
+                # Return default if no response
+                return {
+                    "instruments": [],
+                    "separation_strategy": "Use default ensemble model"
+                }
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse JSON response from DeepSeek")
+            return {
+                "instruments": [],
+                "separation_strategy": "Use default ensemble model"
+            }

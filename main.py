@@ -88,7 +88,7 @@ class EducationalAudioPipeline:
             "educational_mode": False,
             "verbose": True,
             "save_intermediates": True,
-            "visualization": True,
+            "visualization": False,
             "analysis": True,
             "mvsep": {
                 "default_model": "ensemble",
