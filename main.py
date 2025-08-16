@@ -91,7 +91,7 @@ class EducationalAudioPipeline:
             "visualization": False,
             "analysis": True,
             "mvsep": {
-                "default_model": "karaoke",
+                "default_model": "ensemble_extra",
                 "max_stems": 7,
                 "use_llm_optimization": True,
                 "api_timeout": 300,
@@ -303,17 +303,17 @@ class EducationalAudioPipeline:
                 audio_data["sample_rate"]
             ))
 
-        # Step 2: LLM classification for intelligent model selection
-        classification = None
-        model = self.config["mvsep"]["default_model"]
-        stems = 4
-
-        if self.assistant and features:
-            classification = self.assistant.classify_instruments(features)
-            if classification and "instruments" in classification:
-                # Let MVSEP's internal logic select the best model
-                self.console.print(
-                    f"[cyan]Detected instruments: {', '.join([i['name'] for i in classification['instruments']])}[/cyan]")
+        # # Step 2: LLM classification for intelligent model selection
+        # classification = None
+        # model = self.config["mvsep"]["default_model"]
+        # stems = 4
+        #
+        # if self.assistant and features:
+        #     classification = self.assistant.classify_instruments(features)
+        #     if classification and "instruments" in classification:
+        #         # Let MVSEP's internal logic select the best model
+        #         self.console.print(
+        #             f"[cyan]Detected instruments: {', '.join([i['name'] for i in classification['instruments']])}[/cyan]")
 
         # Step 3: Run MVSEP separation
         input_path = Path(audio_data["filepath"])
