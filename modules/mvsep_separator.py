@@ -1,6 +1,6 @@
 import requests
 import time
-import json
+import os
 import torch
 import torchaudio
 from pathlib import Path
@@ -23,7 +23,9 @@ class MVSEPSeparator:
         """Initialize MVSEP separator with configuration."""
         self.config = config
         self.base_url = "https://mvsep.com/api/v1"
-
+        self.api_key = os.environ.get("MVSEP_API_KEY")
+        if not self.api_key:
+            raise ValueError("MVSEP_API_KEY not found in environment variables")
         # Available models with their characteristics
         self.models = {
             # Ensemble models (highest quality)
@@ -102,7 +104,8 @@ class MVSEPSeparator:
         # Session for connection pooling
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Educational-Audio-Pipeline/1.0"
+            "User-Agent": "Educational-Audio-Pipeline/1.0",
+            "Authorization": f"Bearer {self.api_key}"  # Add API key to headers
         })
 
     def separate(self,
