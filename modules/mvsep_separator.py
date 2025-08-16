@@ -5,112 +5,90 @@ import json
 import torch
 import torchaudio
 from pathlib import Path
-from typing import Dict, Optional, Callable, List, Tuple
+from typing import Dict, Optional, Callable, List
 import logging
 import tempfile
-import shutil
-from urllib.parse import urljoin, urlparse, parse_qs
 
 logger = logging.getLogger(__name__)
 
 
 class MVSEPSeparator:
     """
-    MVSEP API-based source separator focused on ensemble_extra model.
-    Supports up to 6-stem separation with ensemble_extra.
+    MVSEP API-based source separator with proper API integration.
     """
 
     def __init__(self, config: Dict):
         """Initialize MVSEP separator with configuration."""
         self.config = config
         self.base_url = "https://mvsep.com"
-        self.api_key = os.environ.get("MVSEP_API_KEY")
-        if not self.api_key:
+        self.api_token = os.environ.get("MVSEP_API_KEY")
+
+        if not self.api_token:
             raise ValueError("MVSEP_API_KEY not found in environment variables")
 
-        # Available models with their characteristics - focused on ensemble_extra
-        self.models = {
-            "ensemble_extra": {
-                "name": "htdemucs_6s",
-                "stems": 6,
-                "stem_names": ["vocals", "drums", "bass", "piano", "guitar", "other"],
-                "description": "6-stem separation: vocals, drums, bass, piano, guitar, other"
-            },
-            "ensemble": {
-                "name": "htdemucs_ft",
-                "stems": 4,
-                "stem_names": ["vocals", "drums", "bass", "other"],
-                "description": "Best overall quality, fine-tuned model"
-            },
-            "fast": {
-                "name": "htdemucs",
-                "stems": 4,
-                "stem_names": ["vocals", "drums", "bass", "other"],
-                "description": "Faster processing, good quality"
-            }
+        # Map model names to MVSEP separation types
+        self.model_to_sep_type = {
+            "ensemble_extra": "htdemucs_6s",  # 6 stems
+            "ensemble": "htdemucs_ft",  # 4 stems, fine-tuned
+            "fast": "htdemucs",  # 4 stems, faster
+            "mdx": "mdx23c",  # MDX23C model
+            "reverb": "reverb_removal",  # Reverb removal
+            "denoise": "denoise_mdx",  # Denoising
         }
 
-        # Processing parameters
-        self.timeout = config.get("mvsep", {}).get("api_timeout", 300)
-        self.quality = config.get("mvsep", {}).get("quality", "high")
-
-        # Session for connection pooling
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Educational-Audio-Pipeline/1.0",
-            "X-API-Key": self.api_key
-        })
+        # Timeout and quality settings
+        self.timeout = config.get("mvsep", {}).get("api_timeout", 600)
+        self.poll_interval = 5  # seconds between status checks
 
     def separate(self,
                  audio_path: Path,
                  model: Optional[str] = None,
-                 stems: Optional[int] = None,
-                 instrument_hints: Optional[Dict] = None,
                  progress_callback: Optional[Callable] = None) -> Dict:
         """
-        Separate audio using MVSEP API with ensemble_extra model.
+        Separate audio using MVSEP API.
 
         Args:
             audio_path: Path to input audio file
             model: Model to use (defaults to ensemble_extra)
-            stems: Number of stems (auto-determined from model)
-            instrument_hints: Not used (LLM disabled)
             progress_callback: Optional callback for progress updates
 
         Returns:
             Dictionary with separated stems and metrics
         """
         start_time = time.time()
+        model = model or "ensemble_extra"
 
         try:
-            # Use ensemble_extra by default
-            model = model or "ensemble_extra"
-            model_info = self.models[model]
-            stems = model_info["stems"]
-            expected_stem_names = model_info["stem_names"]
+            # Get separation type for model
+            sep_type = self.model_to_sep_type.get(model, "htdemucs_6s")
 
-            logger.info(f"Using MVSEP model: {model} ({model_info['name']}) with {stems} stems")
-            logger.info(f"Expected stems: {', '.join(expected_stem_names)}")
+            logger.info(f"Using MVSEP model: {model} (sep_type: {sep_type})")
 
             if progress_callback:
                 progress_callback(0.1, "Uploading audio to MVSEP...")
 
-            # Upload audio and start separation
-            separation_response = self._upload_and_separate(
-                audio_path,
-                model,
-                stems,
-                progress_callback
-            )
+            # Create separation job
+            hash_id = self._create_separation(audio_path, sep_type)
 
-            if not separation_response.get("success"):
-                raise RuntimeError(f"Separation failed: {separation_response.get('error', 'Unknown error')}")
+            if not hash_id:
+                raise RuntimeError("Failed to create separation job")
 
-            # Download and process stems
+            logger.info(f"Separation job created with hash: {hash_id}")
+
+            if progress_callback:
+                progress_callback(0.2, "Processing on MVSEP servers...")
+
+            # Wait for processing and get results
+            result_data = self._wait_for_results(hash_id, progress_callback)
+
+            if not result_data:
+                raise RuntimeError("Failed to get separation results")
+
             if progress_callback:
                 progress_callback(0.8, "Downloading separated stems...")
 
-            stems_data = self._download_stems(separation_response["stems_urls"], expected_stem_names)
+            # Download and process stems
+            stems_data = self._download_stems(result_data)
 
             # Convert to torch tensors
             processed_stems = self._process_stems(stems_data)
@@ -123,254 +101,169 @@ class MVSEPSeparator:
             if progress_callback:
                 progress_callback(1.0, "Separation complete!")
 
+            # Clean up temporary files
+            self._cleanup_temp_files(stems_data)
+
             return {
                 "stems": processed_stems,
                 "source_names": list(processed_stems.keys()),
                 "metrics": metrics,
                 "processing_time": processing_time,
                 "model": model,
-                "model_info": model_info,
-                "llm_guided": False
+                "sep_type": sep_type
             }
 
         except Exception as e:
             logger.error(f"MVSEP separation failed: {e}")
-            # Fallback to basic separation
             return self._fallback_separation(audio_path, progress_callback)
 
-    def _upload_and_separate(self,
-                             audio_path: Path,
-                             model: str,
-                             stems: int,
-                             progress_callback: Optional[Callable]) -> Dict:
-        """Upload audio and initiate separation on MVSEP."""
-        try:
-            model_name = self.models[model]["name"]
+    def _create_separation(self, audio_path: Path, sep_type: str) -> Optional[str]:
+        """
+        Create a separation job on MVSEP servers.
 
-            # Upload file and start separation
-            with open(audio_path, 'rb') as f:
+        Returns:
+            Hash ID of the created job or None if failed
+        """
+        try:
+            with open(audio_path, 'rb') as audio_file:
                 files = {
-                    'audiofile': (audio_path.name, f, 'audio/mpeg')
+                    'audiofile': (audio_path.name, audio_file, 'audio/mpeg')
                 }
 
                 data = {
-                    'api_key': self.api_key,
-                    'model': model_name,
-                    'output_format': 'wav',
-                    'stems': stems
+                    'api_token': self.api_token,
+                    'sep_type': sep_type,
+                    'add_opt1': '',  # Additional options if needed
+                    'add_opt2': '',
+                    'output_format': '1',  # WAV format
+                    'is_demo': '0'
                 }
 
-                # Add quality settings for ensemble_extra
-                if self.quality == "high":
-                    data['shifts'] = 5  # More shifts for better quality
-                    data['overlap'] = 0.5
-                elif self.quality == "medium":
-                    data['shifts'] = 2
-                    data['overlap'] = 0.25
-                else:  # fast
-                    data['shifts'] = 1
-                    data['overlap'] = 0.1
-
-                logger.info(f"Uploading {audio_path.name} to MVSEP with {model_name} model...")
-
-                response = self.session.post(
+                response = requests.post(
                     f"{self.base_url}/api/separation/create",
                     files=files,
                     data=data,
                     timeout=60
                 )
 
-            if response.status_code == 200:
-                result = json.loads(response.content.decode('utf-8'))
+                if response.status_code == 200:
+                    result = response.json()
 
-                if result.get('success'):
-                    hash_id = result['data']['hash']
-                    result_link = result['data']['link']
-
-                    logger.info(f"Separation job created: {hash_id}")
-
-                    if progress_callback:
-                        progress_callback(0.2, "Processing audio on MVSEP servers...")
-
-                    stems_urls = self._wait_and_get_results(result_link, hash_id, progress_callback)
-
-                    return {
-                        "success": True,
-                        "stems_urls": stems_urls,
-                        "hash": hash_id
-                    }
+                    if result.get('success'):
+                        return result['data']['hash']
+                    else:
+                        error_msg = result.get('errors', ['Unknown error'])[0]
+                        logger.error(f"MVSEP API error: {error_msg}")
+                        return None
                 else:
-                    return {
-                        "success": False,
-                        "error": result.get('error', 'Unknown error from API')
-                    }
-            else:
-                return {
-                    "success": False,
-                    "error": f"HTTP {response.status_code}: {response.text}"
-                }
+                    logger.error(f"HTTP {response.status_code}: {response.text}")
+                    return None
 
-        except requests.Timeout:
-            logger.error("MVSEP API timeout")
-            return {"success": False, "error": "Request timeout"}
         except Exception as e:
-            logger.error(f"Upload/separation error: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error(f"Failed to create separation: {e}")
+            return None
 
-    def _wait_and_get_results(self,
-                              result_link: str,
-                              hash_id: str,
-                              progress_callback: Optional[Callable]) -> Dict:
-        """Poll MVSEP for processing completion and get download links."""
-        max_attempts = 60
-        poll_interval = 5
+    def _wait_for_results(self, hash_id: str, progress_callback: Optional[Callable]) -> Optional[Dict]:
+        """
+        Poll MVSEP for processing completion and get results.
+
+        Returns:
+            Result data dictionary or None if failed
+        """
+        max_attempts = self.timeout // self.poll_interval
 
         for attempt in range(max_attempts):
             try:
-                response = self.session.get(result_link, timeout=10)
+                params = {'hash': hash_id}
+                response = requests.get(
+                    f"{self.base_url}/api/separation/get",
+                    params=params,
+                    timeout=300
+                )
 
                 if response.status_code == 200:
-                    content_type = response.headers.get('content-type', '')
+                    data = response.json()
 
-                    if 'application/json' in content_type:
-                        data = response.json()
-
-                        if data.get('status') == 'processing':
+                    if data.get('success'):
+                        # Check if files are ready
+                        if 'files' in data.get('data', {}):
+                            logger.info("Separation completed successfully")
+                            return data['data']
+                        else:
+                            # Still processing
                             if progress_callback:
                                 progress = min(0.7, 0.2 + (attempt / max_attempts) * 0.5)
-                                progress_callback(progress, f"Processing... {attempt * poll_interval}s")
-                            time.sleep(poll_interval)
-                            continue
-
-                        elif data.get('status') == 'error':
-                            raise RuntimeError(f"Processing error: {data.get('error', 'Unknown')}")
-
-                        elif data.get('status') == 'completed':
-                            return self._extract_stem_urls(data, hash_id)
-
-                    elif 'audio' in content_type or response.headers.get('content-disposition'):
-                        return self._get_stem_urls(hash_id)
-
+                                progress_callback(progress, f"Processing... {attempt * self.poll_interval}s")
+                            time.sleep(self.poll_interval)
                     else:
-                        return self._get_stem_urls(hash_id)
-
-                elif response.status_code == 202:
-                    if progress_callback:
-                        progress = min(0.7, 0.2 + (attempt / max_attempts) * 0.5)
-                        progress_callback(progress, f"Processing... {attempt * poll_interval}s")
-                    time.sleep(poll_interval)
-
+                        # Check if still processing
+                        error_msg = data.get('error', '')
+                        if 'not ready' in error_msg.lower() or 'processing' in error_msg.lower():
+                            if progress_callback:
+                                progress = min(0.7, 0.2 + (attempt / max_attempts) * 0.5)
+                                progress_callback(progress, f"Processing... {attempt * self.poll_interval}s")
+                            time.sleep(self.poll_interval)
+                        else:
+                            logger.error(f"MVSEP error: {error_msg}")
+                            return None
                 else:
-                    logger.warning(f"Unexpected status code: {response.status_code}")
-                    time.sleep(poll_interval)
+                    logger.warning(f"Status check failed: HTTP {response.status_code}")
+                    time.sleep(self.poll_interval)
 
             except Exception as e:
                 logger.warning(f"Poll attempt {attempt + 1} failed: {e}")
-                time.sleep(poll_interval)
+                time.sleep(self.poll_interval)
 
-        raise TimeoutError("MVSEP processing timed out")
+        logger.error("Processing timeout exceeded")
+        return None
 
-    def _get_stem_urls(self, hash_id: str) -> Dict:
-        """Construct stem download URLs for ensemble_extra (6 stems)."""
-        base_url = f"{self.base_url}/api/separation/download"
+    def _download_stems(self, result_data: Dict) -> Dict:
+        """
+        Download separated stems from MVSEP.
 
-        stems_urls = {
-            "vocals": f"{base_url}?hash={hash_id}&stem=vocals",
-            "drums": f"{base_url}?hash={hash_id}&stem=drums",
-            "bass": f"{base_url}?hash={hash_id}&stem=bass",
-            "piano": f"{base_url}?hash={hash_id}&stem=piano",
-            "guitar": f"{base_url}?hash={hash_id}&stem=guitar",
-            "other": f"{base_url}?hash={hash_id}&stem=other"
-        }
-
-        try:
-            test_response = self.session.head(stems_urls["vocals"], timeout=5)
-            if test_response.status_code != 200:
-                stems_urls = self._try_alternative_urls(hash_id)
-        except:
-            stems_urls = self._try_alternative_urls(hash_id)
-
-        return stems_urls
-
-    def _try_alternative_urls(self, hash_id: str) -> Dict:
-        """Try alternative URL formats for ensemble_extra stems."""
-        patterns = [
-            f"{self.base_url}/results/{hash_id}",
-            f"{self.base_url}/api/get/{hash_id}",
-            f"{self.base_url}/download/{hash_id}"
-        ]
-
-        for pattern in patterns:
-            stems_urls = {
-                "vocals": f"{pattern}/vocals.wav",
-                "drums": f"{pattern}/drums.wav",
-                "bass": f"{pattern}/bass.wav",
-                "piano": f"{pattern}/piano.wav",
-                "guitar": f"{pattern}/guitar.wav",
-                "other": f"{pattern}/other.wav"
-            }
-
-            try:
-                response = self.session.head(stems_urls["vocals"], timeout=5)
-                if response.status_code == 200:
-                    return stems_urls
-            except:
-                continue
-
-        return {
-            "vocals": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=vocals",
-            "drums": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=drums",
-            "bass": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=bass",
-            "piano": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=piano",
-            "guitar": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=guitar",
-            "other": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=other"
-        }
-
-    def _extract_stem_urls(self, data: Dict, hash_id: str) -> Dict:
-        """Extract stem URLs from API response."""
-        if 'stems' in data:
-            return data['stems']
-        elif 'urls' in data:
-            return data['urls']
-        elif 'downloads' in data:
-            return data['downloads']
-        else:
-            return self._get_stem_urls(hash_id)
-
-    def _download_stems(self, stems_urls: Dict, expected_stem_names: List[str]) -> Dict:
-        """Download separated stems from MVSEP."""
+        Returns:
+            Dictionary mapping stem names to file paths
+        """
         stems_paths = {}
         temp_dir = Path("temp")
         temp_dir.mkdir(exist_ok=True)
 
-        for stem_name in expected_stem_names:
-            if stem_name in stems_urls:
-                url = stems_urls[stem_name]
-                try:
-                    logger.info(f"Downloading {stem_name} from {url}")
+        files = result_data.get('files', [])
 
-                    response = self.session.get(url, stream=True, timeout=30)
+        for file_info in files:
+            try:
+                # Get URL and filename
+                url = file_info['url'].replace('\\/', '/')
+                filename = file_info['download']
 
-                    if response.status_code == 200:
-                        timestamp = int(time.time())
-                        stem_path = temp_dir / f"{stem_name}_{timestamp}.wav"
+                # Extract stem name from filename
+                # Format is usually like "vocals.wav", "drums.wav", etc.
+                stem_name = Path(filename).stem.lower()
 
-                        with open(stem_path, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
+                # Download file
+                response = requests.get(url, stream=True, timeout=60)
 
-                        stems_paths[stem_name] = stem_path
-                        logger.info(f"Downloaded {stem_name} to {stem_path}")
+                if response.status_code == 200:
+                    # Save to temp directory
+                    timestamp = int(time.time())
+                    stem_path = temp_dir / f"{stem_name}_{timestamp}.wav"
 
-                    else:
-                        logger.warning(f"Failed to download {stem_name}: HTTP {response.status_code}")
+                    with open(stem_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
 
-                except Exception as e:
-                    logger.error(f"Failed to download {stem_name}: {e}")
+                    stems_paths[stem_name] = stem_path
+                    file_size = stem_path.stat().st_size / (1024 * 1024)
+                    logger.info(f"Downloaded {stem_name}: {file_size:.2f} MB")
+                else:
+                    logger.warning(f"Failed to download {filename}: HTTP {response.status_code}")
+
+            except Exception as e:
+                logger.error(f"Failed to download stem: {e}")
 
         if not stems_paths:
-            raise RuntimeError("Failed to download any stems")
+            raise RuntimeError("No stems were downloaded successfully")
 
         return stems_paths
 
@@ -392,9 +285,40 @@ class MVSEPSeparator:
 
         return processed_stems
 
-    def _fallback_separation(self,
-                             audio_path: Path,
-                             progress_callback: Optional[Callable]) -> Dict:
+    def _calculate_metrics(self, stems: Dict) -> Dict:
+        """Calculate separation quality metrics."""
+        metrics = {
+            "num_stems": len(stems)
+        }
+
+        total_energy = 0
+        for stem_name, stem_audio in stems.items():
+            if stem_audio is not None and stem_audio.numel() > 0:
+                energy = torch.mean(stem_audio ** 2).item()
+                metrics[f"{stem_name}_energy"] = energy
+                total_energy += energy
+
+        # Calculate energy ratios
+        if total_energy > 0:
+            for stem_name in stems.keys():
+                if f"{stem_name}_energy" in metrics:
+                    metrics[f"{stem_name}_energy_ratio"] = (
+                            metrics[f"{stem_name}_energy"] / total_energy
+                    )
+
+        return metrics
+
+    def _cleanup_temp_files(self, stems_paths: Dict):
+        """Clean up temporary downloaded files."""
+        for stem_path in stems_paths.values():
+            try:
+                if stem_path.exists():
+                    stem_path.unlink()
+                    logger.debug(f"Cleaned up temp file: {stem_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file: {e}")
+
+    def _fallback_separation(self, audio_path: Path, progress_callback: Optional[Callable]) -> Dict:
         """Fallback separation when API is unavailable."""
         logger.warning("Using fallback separation (API unavailable)")
 
@@ -403,13 +327,12 @@ class MVSEPSeparator:
 
         waveform, sr = torchaudio.load(audio_path)
 
+        # Create placeholder stems
         processed_stems = {
             "vocals": waveform * 0.2,
             "drums": waveform * 0.15,
             "bass": waveform * 0.15,
-            "piano": waveform * 0.15,
-            "guitar": waveform * 0.15,
-            "other": waveform * 0.2
+            "other": waveform * 0.5
         }
 
         if progress_callback:
@@ -424,55 +347,42 @@ class MVSEPSeparator:
             },
             "processing_time": 0,
             "model": "fallback",
-            "model_info": {"description": "Fallback separation (no API)"},
-            "llm_guided": False
+            "sep_type": "fallback"
         }
 
-    def _calculate_metrics(self, stems: Dict) -> Dict:
-        """Calculate separation quality metrics."""
-        metrics = {
-            "num_stems": len(stems),
-            "model_confidence": 0.85
-        }
+    def get_available_algorithms(self) -> List[Dict]:
+        """Get list of available MVSEP algorithms."""
+        try:
+            response = requests.get(f"{self.base_url}/api/app/algorithms", timeout=10)
 
-        total_energy = 0
-        for stem_name, stem_audio in stems.items():
-            if stem_audio is not None and stem_audio.numel() > 0:
-                energy = torch.mean(stem_audio ** 2).item()
-                metrics[f"{stem_name}_energy"] = energy
-                total_energy += energy
+            if response.status_code == 200:
+                algorithms = response.json()
 
-        if total_energy > 0:
-            for stem_name in stems.keys():
-                if f"{stem_name}_energy" in metrics:
-                    metrics[f"{stem_name}_energy_ratio"] = (
-                            metrics[f"{stem_name}_energy"] / total_energy
-                    )
+                result = []
+                for algo in algorithms:
+                    result.append({
+                        "id": algo['render_id'],
+                        "name": algo['name'],
+                        "group_id": algo['algorithm_group_id'],
+                        "description": algo.get('algorithm_descriptions', [{}])[0].get('short_description', '')
+                    })
 
-        return metrics
+                return result
+            else:
+                logger.error(f"Failed to get algorithms: HTTP {response.status_code}")
+                return []
 
-    def get_available_models(self) -> List[Dict]:
-        """Get list of available models and their capabilities."""
-        return [
-            {
-                "id": key,
-                "name": value["name"],
-                "stems": value["stems"],
-                "stem_names": value["stem_names"],
-                "description": value["description"]
-            }
-            for key, value in self.models.items()
-        ]
+        except Exception as e:
+            logger.error(f"Failed to fetch algorithms: {e}")
+            return []
 
     def cleanup(self):
         """Clean up resources and temporary files."""
-        self.session.close()
-
         temp_dir = Path("temp")
         if temp_dir.exists():
             for file in temp_dir.glob("*.wav"):
                 try:
                     file.unlink()
-                    logger.info(f"Cleaned up {file}")
+                    logger.debug(f"Cleaned up {file}")
                 except Exception as e:
                     logger.warning(f"Failed to delete temp file {file}: {e}")
