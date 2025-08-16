@@ -94,8 +94,9 @@ class MVSEPSeparator:
         # Session for connection pooling
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Educational-Audio-Pipeline/1.0"
-        })
+            "User-Agent": "Educational-Audio-Pipeline/1.0",
+            "X-API-Key": self.api_key  # Change from "Authorization": f"Bearer {self.api_key}"
+            })
 
     def separate(self,
                  audio_path: Path,

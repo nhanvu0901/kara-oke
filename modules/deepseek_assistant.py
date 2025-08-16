@@ -99,43 +99,59 @@ class DeepSeekAssistant:
         return response or f"Style transfer to {config['checkpoint']} completed."
 
     def classify_instruments(self, features: Dict) -> Dict:
-        """Classify instruments and suggest separation strategy."""
-        # Use double curly braces to escape them in the string
+        """Classify instruments and suggest MVSEP separation strategy."""
         prompt = f"""
-        Analyze these audio features and identify likely instruments:
-
-        Harmonic Features:
+        Analyze these audio features and recommend the best MVSEP model:
+    
+        Audio Features:
         - Harmonic ratio: {features.get('harmonic_ratio', 0):.2f}
         - Spectral centroid: {features.get('spectral_centroid_mean', 0):.1f} Hz
-        - Attack time: {features.get('attack_time', 0):.3f}s
-
-        Frequency Distribution:
+        - Tempo: {features.get('tempo_bpm', 0):.1f} BPM
         - Bass energy: {features.get('bass_energy', 0):.2f}
         - Mid energy: {features.get('mid_energy', 0):.2f}
         - High energy: {features.get('high_energy', 0):.2f}
-
-        1. List probable instruments (with confidence %)
-        2. Suggest optimal frequency ranges for each instrument
-        3. Recommend separation strategy (models/techniques)
-
-        Return as JSON with structure:
+    
+        AVAILABLE MVSEP MODELS (choose ONE):
+        - "ensemble": Best overall quality, 4 stems (vocals, drums, bass, other)
+        - "ensemble_extra": 6 stems (vocals, drums, bass, piano, guitar, other)
+        - "vocal_instrumental": 2 stems (vocals, instrumental) - for karaoke
+        - "karaoke": 2 stems - optimized for vocal removal
+        - "drums_focus": 4 stems - enhanced drum separation
+        - "piano": 2 stems - specialized for piano isolation
+        - "guitar": 2 stems - specialized for guitar isolation
+        - "strings": 2 stems - specialized for string instruments
+        - "fast": 4 stems - faster processing
+        - "ultra_fast": 4 stems - fastest processing
+    
+        Based on the audio features, return ONLY this JSON structure:
         {{
-            "instruments": [{{"name": "piano", "confidence": 0.8, "freq_range": [27, 4186]}}],
-            "separation_strategy": "..."
+            "recommended_model": "ensemble",
+            "confidence": 0.8,
+            "reasoning": "Brief reason for this choice",
+            "expected_stems": 4
         }}
         """
 
         response = self._query(prompt)
         # Parse JSON response
         try:
-            if response:
-                return json.loads(response)
-            else:
-                # Return default if no response
-                return {
-                    "instruments": [],
-                    "separation_strategy": "Use default ensemble model"
-                }
+            if not response:
+                return {}
+
+            try:
+                cleaned_response = response.strip()
+                if cleaned_response.startswith("```json"):
+                    cleaned_response = cleaned_response[7:]  # Remove ```json
+                if cleaned_response.startswith("```"):
+                    cleaned_response = cleaned_response[3:]  # Remove ```
+                if cleaned_response.endswith("```"):
+                    cleaned_response = cleaned_response[:-3]  # Remove ending ```
+                cleaned_response = cleaned_response.strip()
+
+                return json.loads(cleaned_response)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse JSON response from DeepSeek: {response[:100]}...")
+                return {}
         except json.JSONDecodeError:
             logger.warning("Failed to parse JSON response from DeepSeek")
             return {

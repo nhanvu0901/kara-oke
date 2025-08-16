@@ -91,7 +91,7 @@ class EducationalAudioPipeline:
             "visualization": False,
             "analysis": True,
             "mvsep": {
-                "default_model": "ensemble",
+                "default_model": "karaoke",
                 "max_stems": 7,
                 "use_llm_optimization": True,
                 "api_timeout": 300,
