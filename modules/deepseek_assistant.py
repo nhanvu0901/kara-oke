@@ -1,7 +1,7 @@
 import requests
 from typing import Dict, Optional
 import logging
-
+import json
 logger = logging.getLogger(__name__)
 
 
@@ -96,3 +96,33 @@ class DeepSeekAssistant:
 
         response = self._query(prompt)
         return response or f"Style transfer to {config['checkpoint']} completed."
+
+    def classify_instruments(self, features: Dict) -> Dict:
+        """Classify instruments and suggest separation strategy."""
+        prompt = f"""
+        Analyze these audio features and identify likely instruments:
+
+        Harmonic Features:
+        - Harmonic ratio: {features.get('harmonic_ratio', 0):.2f}
+        - Spectral centroid: {features.get('spectral_centroid_mean', 0):.1f} Hz
+        - Attack time: {features.get('attack_time', 0):.3f}s
+
+        Frequency Distribution:
+        - Bass energy: {features.get('bass_energy', 0):.2f}
+        - Mid energy: {features.get('mid_energy', 0):.2f}
+        - High energy: {features.get('high_energy', 0):.2f}
+
+        1. List probable instruments (with confidence %)
+        2. Suggest optimal frequency ranges for each instrument
+        3. Recommend separation strategy (models/techniques)
+
+        Return as JSON with structure:
+        {
+        "instruments": [{"name": "piano", "confidence": 0.8, "freq_range": [27, 4186]}],
+            "separation_strategy": "..."
+        }
+        """
+
+        response = self._query(prompt)
+        # Parse JSON response
+        return json.loads(response) if response else {}

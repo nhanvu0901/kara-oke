@@ -36,7 +36,7 @@ load_dotenv()
 
 # Import pipeline modules
 from modules.audio_loader import AudioLoader
-from modules.demucs_separator import DemucsSeparator
+from modules.mvsep_separator import MVSEPSeparator
 from modules.audiocraft_processor import AudioCraftProcessor
 from modules.ddsp_transfer import DDSPStyleTransfer
 from modules.audio_analyzer import AudioAnalyzer
@@ -88,14 +88,12 @@ class EducationalAudioPipeline:
             "save_intermediates": True,
             "visualization": True,
             "analysis": True,
-            "demucs": {
-                "model": "htdemucs_ft",  # Latest fine-tuned model
-                "split": True,
-                "two_stems": None,
-                "mp3": True,
-                "mp3_rate": 320,
-                "float32": False,
-                "int24": False,
+            "mvsep": {
+                "default_model": "ensemble",
+                "max_stems": 7,
+                "use_llm_optimization": True,
+                "api_timeout": 300,
+                "quality": "high"  # high/medium/fast
             },
             "audiocraft": {
                 "model": "musicgen-medium",
@@ -144,8 +142,9 @@ class EducationalAudioPipeline:
             progress.add_task("Loading audio utilities...")
             self.audio_loader = AudioLoader(self.config)
 
-            progress.add_task("Initializing Demucs v4...")
-            self.separator = DemucsSeparator(self.config)
+            # Replace initialization with:
+            progress.add_task("Initializing MVSEP API...")
+            self.separator = MVSEPSeparator(self.config)
 
             progress.add_task("Loading AudioCraft suite...")
             self.audiocraft = AudioCraftProcessor(self.config)
@@ -201,9 +200,9 @@ class EducationalAudioPipeline:
             if interactive:
                 self._interactive_checkpoint("Audio loaded", audio_data)
 
-            # Stage 2: Source separation with Demucs v4
+            # Stage 2: Source separation
             if mode in ["full", "learning", "separator"]:
-                self._print_stage("Source Separation (Demucs v4)", "🎛️")
+                self._print_stage("Source Separation", "🎛️")
                 separated = self._separate_sources(audio_data, results, interactive)
 
                 if interactive:
@@ -286,12 +285,30 @@ class EducationalAudioPipeline:
         return audio_data
 
     def _separate_sources(self, audio_data: Dict, results: Dict, interactive: bool) -> Dict:
-        """Perform source separation using Demucs v4."""
-        # Run separation
+        """Perform source separation """
+        # Step 1: Extract advanced features
+        features = self.analyzer._extract_instrument_features(
+            audio_data["waveform"].numpy(),
+            audio_data["sample_rate"]
+        )
+
+        # Step 2: LLM classification
+        if self.assistant:
+            classification = self.assistant.classify_instruments(features)
+
+            # Step 3: Adaptive separation based on LLM insights
+            model = self._select_optimal_model(classification)
+            stems = self._determine_stem_count(classification)
+        else:
+            model = "ensemble"
+            stems = 4
+
+        # Step 4: Run MVSEP separation
         separated = self.separator.separate(
-            audio_data["waveform"],
-            audio_data["sample_rate"],
-            progress_callback=self._progress_callback if interactive else None
+            audio_data["filepath"],
+            model=model,
+            stems=stems,
+            instrument_hints=classification if self.assistant else None
         )
 
         # Save separated stems
