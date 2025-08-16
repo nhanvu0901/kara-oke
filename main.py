@@ -2,7 +2,7 @@
 """
 Educational Audio Processing Pipeline
 =====================================
-Advanced audio manipulation using Meta's AI models for learning purposes.
+Advanced audio manipulation using AI models for learning purposes.
 Demonstrates source separation, style transfer, and audio enhancement.
 
 Author: Educational AI Audio Lab
@@ -44,7 +44,9 @@ from modules.visualization import AudioVisualizer
 from modules.deepseek_assistant import DeepSeekAssistant
 from modules.educational_reporter import EducationalReporter
 import ssl
+
 ssl._create_default_https_context = ssl._create_unverified_context
+
 # Configure rich console for beautiful output
 console = Console()
 
@@ -142,7 +144,7 @@ class EducationalAudioPipeline:
             progress.add_task("Loading audio utilities...")
             self.audio_loader = AudioLoader(self.config)
 
-            # Replace initialization with:
+            # Use MVSEP for separation
             progress.add_task("Initializing MVSEP API...")
             self.separator = MVSEPSeparator(self.config)
 
@@ -200,9 +202,9 @@ class EducationalAudioPipeline:
             if interactive:
                 self._interactive_checkpoint("Audio loaded", audio_data)
 
-            # Stage 2: Source separation
+            # Stage 2: Source separation using MVSEP
             if mode in ["full", "learning", "separator"]:
-                self._print_stage("Source Separation", "🎛️")
+                self._print_stage("Source Separation (MVSEP)", "🎛️")
                 separated = self._separate_sources(audio_data, results, interactive)
 
                 if interactive:
@@ -285,30 +287,45 @@ class EducationalAudioPipeline:
         return audio_data
 
     def _separate_sources(self, audio_data: Dict, results: Dict, interactive: bool) -> Dict:
-        """Perform source separation """
-        # Step 1: Extract advanced features
-        features = self.analyzer._extract_instrument_features(
-            audio_data["waveform"].numpy(),
-            audio_data["sample_rate"]
-        )
+        """Perform source separation using MVSEP."""
+        # Step 1: Extract advanced features for intelligent model selection
+        features = {}
+        if hasattr(self.analyzer, '_extract_spectral_features'):
+            features.update(self.analyzer._extract_spectral_features(
+                audio_data["waveform"].mean(dim=0).numpy() if audio_data["waveform"].dim() > 1
+                else audio_data["waveform"].numpy(),
+                audio_data["sample_rate"]
+            ))
+        if hasattr(self.analyzer, '_extract_harmonic_features'):
+            features.update(self.analyzer._extract_harmonic_features(
+                audio_data["waveform"].mean(dim=0).numpy() if audio_data["waveform"].dim() > 1
+                else audio_data["waveform"].numpy(),
+                audio_data["sample_rate"]
+            ))
 
-        # Step 2: LLM classification
-        if self.assistant:
+        # Step 2: LLM classification for intelligent model selection
+        classification = None
+        model = self.config["mvsep"]["default_model"]
+        stems = 4
+
+        if self.assistant and features:
             classification = self.assistant.classify_instruments(features)
+            if classification and "instruments" in classification:
+                # Let MVSEP's internal logic select the best model
+                self.console.print(
+                    f"[cyan]Detected instruments: {', '.join([i['name'] for i in classification['instruments']])}[/cyan]")
 
-            # Step 3: Adaptive separation based on LLM insights
-            model = self._select_optimal_model(classification)
-            stems = self._determine_stem_count(classification)
-        else:
-            model = "ensemble"
-            stems = 4
+        # Step 3: Run MVSEP separation
+        input_path = Path(audio_data["filepath"])
 
-        # Step 4: Run MVSEP separation
+        self.console.print(f"[yellow]Using MVSEP model: {model} with {stems} stems[/yellow]")
+
         separated = self.separator.separate(
-            audio_data["filepath"],
+            input_path,
             model=model,
             stems=stems,
-            instrument_hints=classification if self.assistant else None
+            instrument_hints=classification,
+            progress_callback=self._progress_callback
         )
 
         # Save separated stems
@@ -333,17 +350,19 @@ class EducationalAudioPipeline:
 
         # Store results
         results["stages"]["separation"] = {
-            "model": self.config["demucs"]["model"],
+            "model": separated["model"],
+            "model_info": separated.get("model_info", {}),
             "stems": stem_paths,
             "metrics": separated.get("metrics", {}),
-            "processing_time": separated.get("processing_time", 0)
+            "processing_time": separated.get("processing_time", 0),
+            "llm_guided": separated.get("llm_guided", False)
         }
 
         # Educational insight about separation
         if self.assistant:
             insight = self.assistant.explain_source_separation(
                 separated["metrics"],
-                self.config["demucs"]["model"]
+                separated["model"]
             )
             results["insights"].append({
                 "stage": "separation",
@@ -552,13 +571,19 @@ def main():
                         default="learning",
                         help="Processing mode")
 
-    # Model selection
-    parser.add_argument("--separator", default="demucs",
-                        choices=["demucs"],
-                        help="Source separator model")
-    parser.add_argument("--demucs-model", default="htdemucs_ft",
-                        choices=["htdemucs", "htdemucs_ft", "htdemucs_6s"],
-                        help="Demucs model variant")
+    # MVSEP Model selection
+    parser.add_argument("--mvsep-model", default="ensemble",
+                        choices=["ensemble", "ensemble_extra", "fast", "ultra_fast",
+                                 "vocal_instrumental", "karaoke", "drums_focus",
+                                 "piano", "guitar", "strings"],
+                        help="MVSEP model variant")
+    parser.add_argument("--mvsep-quality", default="high",
+                        choices=["high", "medium", "fast"],
+                        help="MVSEP processing quality")
+    parser.add_argument("--mvsep-stems", type=int, default=4,
+                        help="Number of stems to separate (2-7)")
+
+    # AudioCraft settings
     parser.add_argument("--audiocraft-model", default="musicgen-medium",
                         help="AudioCraft model to use")
 
@@ -589,10 +614,10 @@ def main():
     # Print welcome banner
     console.print(Panel.fit(
         "[bold magenta]Educational Audio Processing Pipeline[/bold magenta]\n"
-        "[dim]Learn advanced AI audio processing with Meta's latest models[/dim]\n\n"
+        "[dim]Learn advanced AI audio processing with state-of-the-art models[/dim]\n\n"
         f"📂 Input: {args.input}\n"
         f"🎛️ Mode: {args.mode}\n"
-        f"🤖 Models: Demucs v4 + AudioCraft + DDSP",
+        f"🤖 Models: MVSEP + AudioCraft + DDSP",
         title="🎵 Welcome to Audio AI Learning Lab",
         border_style="magenta"
     ))
@@ -600,17 +625,32 @@ def main():
     # Prepare configuration
     config = {
         "output_dir": args.output,
-        "temp_dir": Path("temp"),  # Add this line
-        "models_dir": Path("models"),  # Add this line
+        "temp_dir": Path("temp"),
+        "models_dir": Path("models"),
         "educational_mode": args.educational,
         "verbose": args.verbose,
         "visualization": args.visualize,
         "analysis": args.analyze,
-        "demucs": {
-            "model": args.demucs_model,
+        "mvsep": {
+            "default_model": args.mvsep_model,
+            "quality": args.mvsep_quality,
+            "max_stems": args.mvsep_stems,
+            "use_llm_optimization": True,
+            "api_timeout": 300,
         },
         "audiocraft": {
             "model": args.audiocraft_model,
+            "use_sampling": True,
+            "top_k": 250,
+            "top_p": 0.0,
+            "temperature": 1.0,
+            "duration": 8.0,
+        },
+        "ddsp": {
+            "checkpoint": "violin",
+            "pitch_shift": 0,
+            "loudness_shift": 0,
+            "f0_octave_shift": 0,
         },
         "deepseek": {
             "api_key": args.deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY"),
@@ -646,6 +686,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import os
-
     main()
