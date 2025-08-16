@@ -36,7 +36,7 @@ load_dotenv()
 
 # Import pipeline modules
 from modules.audio_loader import AudioLoader
-from modules.demucs_separator import DemucsSeparator
+from modules.mvsep_separator import MVSEPSeparator
 from modules.audiocraft_processor import AudioCraftProcessor
 from modules.ddsp_transfer import DDSPStyleTransfer
 from modules.audio_analyzer import AudioAnalyzer
@@ -88,14 +88,15 @@ class EducationalAudioPipeline:
             "save_intermediates": True,
             "visualization": True,
             "analysis": True,
-            "demucs": {
-                "model": "htdemucs_ft",  # Latest fine-tuned model
-                "split": True,
-                "two_stems": None,
-                "mp3": True,
-                "mp3_rate": 320,
-                "float32": False,
-                "int24": False,
+            "mvsep": {
+                "default_model": "htdemucs_ft",
+                "quality_priority": "very_high",  # very_high, high, balanced, fast
+                "multi_pass": True,
+                "max_passes": 3,
+                "use_api": False,  # Set to True if using MVSEP API
+                "api_url": "http://localhost:8080",
+                "ensemble_mode": True,
+                "target_snr": 30.0,  # Target SNR in dB
             },
             "audiocraft": {
                 "model": "musicgen-medium",
@@ -145,7 +146,7 @@ class EducationalAudioPipeline:
             self.audio_loader = AudioLoader(self.config)
 
             progress.add_task("Initializing Demucs v4...")
-            self.separator = DemucsSeparator(self.config)
+            self.separator = MVSEPSeparator(self.config)
 
             progress.add_task("Loading AudioCraft suite...")
             self.audiocraft = AudioCraftProcessor(self.config)
@@ -288,9 +289,31 @@ class EducationalAudioPipeline:
     def _separate_sources(self, audio_data: Dict, results: Dict, interactive: bool) -> Dict:
         """Perform source separation using Demucs v4."""
         # Run separation
+        instrument_features = self.analyzer.extract_instrument_features(
+            audio_data["mono_waveform"].numpy()[0],
+            audio_data["sample_rate"]
+        )
+
+        # Get LLM classification and strategy
+        if self.assistant:
+            classification = self.assistant.classify_instruments(instrument_features)
+            logger.info(f"Detected instruments: {classification['instruments']}")
+
+            # Create separation strategy
+            strategy = {
+                "models": classification["recommended_models"],
+                "passes": classification["strategy"]["passes"],
+                "combination_method": classification["strategy"]["method"]
+            }
+        else:
+            strategy = None
+
+        # Run multi-pass separation with strategy
         separated = self.separator.separate(
             audio_data["waveform"],
             audio_data["sample_rate"],
+            target_instruments=list(classification.get('instruments', {}).keys()) if classification else None,
+            strategy=strategy,
             progress_callback=self._progress_callback if interactive else None
         )
 

@@ -96,3 +96,60 @@ class DeepSeekAssistant:
 
         response = self._query(prompt)
         return response or f"Style transfer to {config['checkpoint']} completed."
+
+    def classify_instruments(self, features: Dict) -> Dict:
+        """Use LLM to classify instruments and recommend separation strategy."""
+
+        prompt = f"""
+        Analyze these audio features and identify likely instruments present:
+
+        Harmonic Ratio: {features.get('harmonic_ratio', 0):.3f}
+        Percussive Ratio: {features.get('percussive_ratio', 0):.3f}
+        Spectral Complexity: {features.get('spectral_complexity', 0):.3f}
+        Attack Sharpness: {features.get('attack_sharpness', 0):.3f}
+        Vocal Presence: {features.get('vocal_presence', 0):.3f}
+        Onset Density: {features.get('onset_density', 0):.2f}
+
+        Frequency Band Energy Distribution:
+        - Sub-bass (20-250Hz): {features.get('band_0_energy', 0):.0f}
+        - Bass (250-500Hz): {features.get('band_1_energy', 0):.0f}
+        - Midrange (500-2kHz): {features.get('band_2_energy', 0):.0f}
+        - Upper-mid (2-4kHz): {features.get('band_3_energy', 0):.0f}
+        - Presence (4-8kHz): {features.get('band_4_energy', 0):.0f}
+        - Brilliance (8-20kHz): {features.get('band_5_energy', 0):.0f}
+
+        Based on these features:
+        1. List the likely instruments present (with confidence 0-1)
+        2. Recommend optimal separation models for these instruments
+        3. Suggest separation strategy (single-pass, multi-pass, ensemble)
+        4. Identify potential challenges for separation
+
+        Respond in JSON format:
+        {{
+            "instruments": {{"instrument_name": confidence}},
+            "recommended_models": ["model1", "model2"],
+            "strategy": {{"passes": N, "method": "...", "priority": "..."}},
+            "challenges": ["challenge1", "challenge2"]
+        }}
+        """
+
+        response = self._query(prompt)
+
+        if response:
+            try:
+                import json
+                return json.loads(response)
+            except:
+                return {
+                    "instruments": {"unknown": 0.5},
+                    "recommended_models": ["htdemucs_ft"],
+                    "strategy": {"passes": 1, "method": "standard", "priority": "balanced"},
+                    "challenges": ["Unable to parse LLM response"]
+                }
+
+        return {
+            "instruments": {"unknown": 0.5},
+            "recommended_models": ["htdemucs_ft"],
+            "strategy": {"passes": 1, "method": "standard", "priority": "balanced"},
+            "challenges": ["No LLM available"]
+        }
