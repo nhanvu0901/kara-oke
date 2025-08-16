@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 
 class MVSEPSeparator:
     """
-    MVSEP API-based source separator with LLM-guided optimization.
-    Supports multiple models and up to 7-stem separation.
+    MVSEP API-based source separator focused on ensemble_extra model.
+    Supports up to 6-stem separation with ensemble_extra.
     """
 
     def __init__(self, config: Dict):
@@ -28,75 +28,38 @@ class MVSEPSeparator:
         if not self.api_key:
             raise ValueError("MVSEP_API_KEY not found in environment variables")
 
-        # Available models with their characteristics
+        # Available models with their characteristics - focused on ensemble_extra
         self.models = {
-            # Ensemble models (highest quality)
-            "ensemble": {
-                "name": "htdemucs_ft",
-                "stems": 4,
-                "description": "Best overall quality, fine-tuned model"
-            },
             "ensemble_extra": {
                 "name": "htdemucs_6s",
                 "stems": 6,
+                "stem_names": ["vocals", "drums", "bass", "piano", "guitar", "other"],
                 "description": "6-stem separation: vocals, drums, bass, piano, guitar, other"
             },
-            # Fast models
+            "ensemble": {
+                "name": "htdemucs_ft",
+                "stems": 4,
+                "stem_names": ["vocals", "drums", "bass", "other"],
+                "description": "Best overall quality, fine-tuned model"
+            },
             "fast": {
                 "name": "htdemucs",
                 "stems": 4,
+                "stem_names": ["vocals", "drums", "bass", "other"],
                 "description": "Faster processing, good quality"
-            },
-            "ultra_fast": {
-                "name": "mdx_extra_q",
-                "stems": 4,
-                "description": "Fastest processing, decent quality"
-            },
-            # Specialized models
-            "vocal_instrumental": {
-                "name": "mdx23c",
-                "stems": 2,
-                "description": "Optimized for vocal/instrumental separation"
-            },
-            "karaoke": {
-                "name": "uvr_mdx_net_voc_ft",
-                "stems": 2,
-                "description": "Best for karaoke (removing vocals)"
-            },
-            "drums_focus": {
-                "name": "demucs3_mdx_extra",
-                "stems": 4,
-                "description": "Enhanced drum separation"
-            },
-            # Instrument-specific
-            "piano": {
-                "name": "piano_separator_v1",
-                "stems": 2,
-                "description": "Specialized for piano isolation"
-            },
-            "guitar": {
-                "name": "guitar_separator_v1",
-                "stems": 2,
-                "description": "Specialized for guitar isolation"
-            },
-            "strings": {
-                "name": "strings_separator_v1",
-                "stems": 2,
-                "description": "Specialized for string instruments"
             }
         }
 
         # Processing parameters
         self.timeout = config.get("mvsep", {}).get("api_timeout", 300)
         self.quality = config.get("mvsep", {}).get("quality", "high")
-        self.use_llm = config.get("mvsep", {}).get("use_llm_optimization", True)
 
         # Session for connection pooling
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Educational-Audio-Pipeline/1.0",
-            "X-API-Key": self.api_key  # Change from "Authorization": f"Bearer {self.api_key}"
-            })
+            "X-API-Key": self.api_key
+        })
 
     def separate(self,
                  audio_path: Path,
@@ -105,13 +68,13 @@ class MVSEPSeparator:
                  instrument_hints: Optional[Dict] = None,
                  progress_callback: Optional[Callable] = None) -> Dict:
         """
-        Separate audio using MVSEP API with intelligent model selection.
+        Separate audio using MVSEP API with ensemble_extra model.
 
         Args:
             audio_path: Path to input audio file
-            model: Model to use (auto-selected if None)
-            stems: Number of stems (auto-determined if None)
-            instrument_hints: LLM classification results for optimization
+            model: Model to use (defaults to ensemble_extra)
+            stems: Number of stems (auto-determined from model)
+            instrument_hints: Not used (LLM disabled)
             progress_callback: Optional callback for progress updates
 
         Returns:
@@ -120,18 +83,19 @@ class MVSEPSeparator:
         start_time = time.time()
 
         try:
-            # Step 1: Select optimal model based on LLM hints
-            if not model and instrument_hints and self.use_llm:
-                model, stems = self._select_optimal_model(instrument_hints)
-                logger.info(f"LLM-guided selection: {model} with {stems} stems")
-            else:
-                model = model or self.config.get("mvsep", {}).get("default_model", "ensemble")
-                stems = stems or self.models[model]["stems"]
+            # Use ensemble_extra by default
+            model = model or "ensemble_extra"
+            model_info = self.models[model]
+            stems = model_info["stems"]
+            expected_stem_names = model_info["stem_names"]
+
+            logger.info(f"Using MVSEP model: {model} ({model_info['name']}) with {stems} stems")
+            logger.info(f"Expected stems: {', '.join(expected_stem_names)}")
 
             if progress_callback:
                 progress_callback(0.1, "Uploading audio to MVSEP...")
 
-            # Step 2: Upload audio and start separation
+            # Upload audio and start separation
             separation_response = self._upload_and_separate(
                 audio_path,
                 model,
@@ -142,17 +106,17 @@ class MVSEPSeparator:
             if not separation_response.get("success"):
                 raise RuntimeError(f"Separation failed: {separation_response.get('error', 'Unknown error')}")
 
-            # Step 3: Download and process stems
+            # Download and process stems
             if progress_callback:
                 progress_callback(0.8, "Downloading separated stems...")
 
-            stems_data = self._download_stems(separation_response["stems_urls"])
+            stems_data = self._download_stems(separation_response["stems_urls"], expected_stem_names)
 
-            # Step 4: Convert to torch tensors
+            # Convert to torch tensors
             processed_stems = self._process_stems(stems_data)
 
-            # Step 5: Calculate metrics
-            metrics = self._calculate_metrics(processed_stems, instrument_hints)
+            # Calculate metrics
+            metrics = self._calculate_metrics(processed_stems)
 
             processing_time = time.time() - start_time
 
@@ -165,8 +129,8 @@ class MVSEPSeparator:
                 "metrics": metrics,
                 "processing_time": processing_time,
                 "model": model,
-                "model_info": self.models[model],
-                "llm_guided": bool(instrument_hints and self.use_llm)
+                "model_info": model_info,
+                "llm_guided": False
             }
 
         except Exception as e:
@@ -181,7 +145,6 @@ class MVSEPSeparator:
                              progress_callback: Optional[Callable]) -> Dict:
         """Upload audio and initiate separation on MVSEP."""
         try:
-            # Prepare the API parameters
             model_name = self.models[model]["name"]
 
             # Upload file and start separation
@@ -197,9 +160,9 @@ class MVSEPSeparator:
                     'stems': stems
                 }
 
-                # Add quality settings
+                # Add quality settings for ensemble_extra
                 if self.quality == "high":
-                    data['shifts'] = 5
+                    data['shifts'] = 5  # More shifts for better quality
                     data['overlap'] = 0.5
                 elif self.quality == "medium":
                     data['shifts'] = 2
@@ -208,7 +171,7 @@ class MVSEPSeparator:
                     data['shifts'] = 1
                     data['overlap'] = 0.1
 
-                logger.info(f"Uploading {audio_path.name} to MVSEP...")
+                logger.info(f"Uploading {audio_path.name} to MVSEP with {model_name} model...")
 
                 response = self.session.post(
                     f"{self.base_url}/api/separation/create",
@@ -221,7 +184,6 @@ class MVSEPSeparator:
                 result = json.loads(response.content.decode('utf-8'))
 
                 if result.get('success'):
-                    # Extract hash and link from response
                     hash_id = result['data']['hash']
                     result_link = result['data']['link']
 
@@ -230,7 +192,6 @@ class MVSEPSeparator:
                     if progress_callback:
                         progress_callback(0.2, "Processing audio on MVSEP servers...")
 
-                    # Wait for processing to complete and get results
                     stems_urls = self._wait_and_get_results(result_link, hash_id, progress_callback)
 
                     return {
@@ -261,20 +222,17 @@ class MVSEPSeparator:
                               hash_id: str,
                               progress_callback: Optional[Callable]) -> Dict:
         """Poll MVSEP for processing completion and get download links."""
-        max_attempts = 60  # 5 minutes max wait
-        poll_interval = 5  # seconds
+        max_attempts = 60
+        poll_interval = 5
 
         for attempt in range(max_attempts):
             try:
-                # Poll the result link
                 response = self.session.get(result_link, timeout=10)
 
                 if response.status_code == 200:
-                    # Check if JSON response (still processing) or file ready
                     content_type = response.headers.get('content-type', '')
 
                     if 'application/json' in content_type:
-                        # Still processing or error
                         data = response.json()
 
                         if data.get('status') == 'processing':
@@ -288,19 +246,15 @@ class MVSEPSeparator:
                             raise RuntimeError(f"Processing error: {data.get('error', 'Unknown')}")
 
                         elif data.get('status') == 'completed':
-                            # Get stem URLs
                             return self._extract_stem_urls(data, hash_id)
 
                     elif 'audio' in content_type or response.headers.get('content-disposition'):
-                        # Results might be ready - try to get individual stems
                         return self._get_stem_urls(hash_id)
 
                     else:
-                        # HTML or other response - results might be ready
                         return self._get_stem_urls(hash_id)
 
                 elif response.status_code == 202:
-                    # Still processing
                     if progress_callback:
                         progress = min(0.7, 0.2 + (attempt / max_attempts) * 0.5)
                         progress_callback(progress, f"Processing... {attempt * poll_interval}s")
@@ -317,23 +271,21 @@ class MVSEPSeparator:
         raise TimeoutError("MVSEP processing timed out")
 
     def _get_stem_urls(self, hash_id: str) -> Dict:
-        """Construct stem download URLs based on hash."""
-        # MVSEP typically provides stems with predictable URLs
-        # This might need adjustment based on actual API behavior
+        """Construct stem download URLs for ensemble_extra (6 stems)."""
         base_url = f"{self.base_url}/api/separation/download"
 
         stems_urls = {
             "vocals": f"{base_url}?hash={hash_id}&stem=vocals",
             "drums": f"{base_url}?hash={hash_id}&stem=drums",
             "bass": f"{base_url}?hash={hash_id}&stem=bass",
+            "piano": f"{base_url}?hash={hash_id}&stem=piano",
+            "guitar": f"{base_url}?hash={hash_id}&stem=guitar",
             "other": f"{base_url}?hash={hash_id}&stem=other"
         }
 
-        # Verify at least one URL is accessible
         try:
             test_response = self.session.head(stems_urls["vocals"], timeout=5)
             if test_response.status_code != 200:
-                # Try alternative URL format
                 stems_urls = self._try_alternative_urls(hash_id)
         except:
             stems_urls = self._try_alternative_urls(hash_id)
@@ -341,8 +293,7 @@ class MVSEPSeparator:
         return stems_urls
 
     def _try_alternative_urls(self, hash_id: str) -> Dict:
-        """Try alternative URL formats for stems."""
-        # Alternative URL patterns MVSEP might use
+        """Try alternative URL formats for ensemble_extra stems."""
         patterns = [
             f"{self.base_url}/results/{hash_id}",
             f"{self.base_url}/api/get/{hash_id}",
@@ -354,22 +305,24 @@ class MVSEPSeparator:
                 "vocals": f"{pattern}/vocals.wav",
                 "drums": f"{pattern}/drums.wav",
                 "bass": f"{pattern}/bass.wav",
+                "piano": f"{pattern}/piano.wav",
+                "guitar": f"{pattern}/guitar.wav",
                 "other": f"{pattern}/other.wav"
             }
 
             try:
-                # Test if accessible
                 response = self.session.head(stems_urls["vocals"], timeout=5)
                 if response.status_code == 200:
                     return stems_urls
             except:
                 continue
 
-        # Default fallback
         return {
             "vocals": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=vocals",
             "drums": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=drums",
             "bass": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=bass",
+            "piano": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=piano",
+            "guitar": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=guitar",
             "other": f"{self.base_url}/api/separation/get?hash={hash_id}&stem=other"
         }
 
@@ -382,40 +335,39 @@ class MVSEPSeparator:
         elif 'downloads' in data:
             return data['downloads']
         else:
-            # Construct URLs if not provided
             return self._get_stem_urls(hash_id)
 
-    def _download_stems(self, stems_urls: Dict) -> Dict:
+    def _download_stems(self, stems_urls: Dict, expected_stem_names: List[str]) -> Dict:
         """Download separated stems from MVSEP."""
         stems_paths = {}
         temp_dir = Path("temp")
         temp_dir.mkdir(exist_ok=True)
 
-        for stem_name, url in stems_urls.items():
-            try:
-                logger.info(f"Downloading {stem_name} from {url}")
+        for stem_name in expected_stem_names:
+            if stem_name in stems_urls:
+                url = stems_urls[stem_name]
+                try:
+                    logger.info(f"Downloading {stem_name} from {url}")
 
-                response = self.session.get(url, stream=True, timeout=30)
+                    response = self.session.get(url, stream=True, timeout=30)
 
-                if response.status_code == 200:
-                    # Generate unique filename
-                    timestamp = int(time.time())
-                    stem_path = temp_dir / f"{stem_name}_{timestamp}.wav"
+                    if response.status_code == 200:
+                        timestamp = int(time.time())
+                        stem_path = temp_dir / f"{stem_name}_{timestamp}.wav"
 
-                    # Download in chunks
-                    with open(stem_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
+                        with open(stem_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
 
-                    stems_paths[stem_name] = stem_path
-                    logger.info(f"Downloaded {stem_name} to {stem_path}")
+                        stems_paths[stem_name] = stem_path
+                        logger.info(f"Downloaded {stem_name} to {stem_path}")
 
-                else:
-                    logger.warning(f"Failed to download {stem_name}: HTTP {response.status_code}")
+                    else:
+                        logger.warning(f"Failed to download {stem_name}: HTTP {response.status_code}")
 
-            except Exception as e:
-                logger.error(f"Failed to download {stem_name}: {e}")
+                except Exception as e:
+                    logger.error(f"Failed to download {stem_name}: {e}")
 
         if not stems_paths:
             raise RuntimeError("Failed to download any stems")
@@ -449,16 +401,15 @@ class MVSEPSeparator:
         if progress_callback:
             progress_callback(0.5, "Using local fallback separation...")
 
-        # Load original audio
         waveform, sr = torchaudio.load(audio_path)
 
-        # Create basic frequency-based separation (very basic fallback)
-        # This is just for demonstration - real separation requires proper models
         processed_stems = {
-            "vocals": waveform * 0.3,  # Placeholder
-            "drums": waveform * 0.2,  # Placeholder
-            "bass": waveform * 0.25,  # Placeholder
-            "other": waveform * 0.25  # Placeholder
+            "vocals": waveform * 0.2,
+            "drums": waveform * 0.15,
+            "bass": waveform * 0.15,
+            "piano": waveform * 0.15,
+            "guitar": waveform * 0.15,
+            "other": waveform * 0.2
         }
 
         if progress_callback:
@@ -477,68 +428,13 @@ class MVSEPSeparator:
             "llm_guided": False
         }
 
-    def _select_optimal_model(self, instrument_hints: Dict) -> Tuple[str, int]:
-        """
-        Select optimal model based on LLM instrument classification.
-
-        Args:
-            instrument_hints: LLM classification with instruments and confidence
-
-        Returns:
-            Tuple of (model_name, num_stems)
-        """
-        instruments = instrument_hints.get("instruments", [])
-
-        if not instruments:
-            return "ensemble", 4
-
-        # Analyze instrument distribution
-        has_piano = any(i["name"].lower() in ["piano", "keyboard"] for i in instruments)
-        has_guitar = any(i["name"].lower() in ["guitar", "electric guitar", "acoustic guitar"] for i in instruments)
-        has_strings = any(i["name"].lower() in ["violin", "cello", "strings", "orchestra"] for i in instruments)
-        has_drums = any(i["name"].lower() in ["drums", "percussion"] for i in instruments)
-        has_vocals = any(i["name"].lower() in ["vocals", "voice", "singing"] for i in instruments)
-
-        instrument_count = len(instruments)
-
-        # Decision tree for model selection
-        if instrument_count <= 2:
-            if has_vocals and not has_drums:
-                return "vocal_instrumental", 2
-            elif has_piano and not has_drums:
-                return "piano", 2
-            elif has_guitar and not has_drums:
-                return "guitar", 2
-            else:
-                return "fast", 4
-
-        elif instrument_count <= 4:
-            if has_drums:
-                return "drums_focus", 4
-            else:
-                return "ensemble", 4
-
-        elif instrument_count <= 6:
-            # Use 6-stem model for complex arrangements
-            if has_piano and has_guitar:
-                return "ensemble_extra", 6
-            else:
-                return "ensemble", 4
-
-        else:
-            # Very complex mix - use best available
-            return "ensemble_extra", 6
-
-    def _calculate_metrics(self,
-                           stems: Dict,
-                           instrument_hints: Optional[Dict]) -> Dict:
+    def _calculate_metrics(self, stems: Dict) -> Dict:
         """Calculate separation quality metrics."""
         metrics = {
             "num_stems": len(stems),
             "model_confidence": 0.85
         }
 
-        # Energy distribution
         total_energy = 0
         for stem_name, stem_audio in stems.items():
             if stem_audio is not None and stem_audio.numel() > 0:
@@ -546,22 +442,12 @@ class MVSEPSeparator:
                 metrics[f"{stem_name}_energy"] = energy
                 total_energy += energy
 
-        # Normalize energies
         if total_energy > 0:
             for stem_name in stems.keys():
                 if f"{stem_name}_energy" in metrics:
                     metrics[f"{stem_name}_energy_ratio"] = (
                             metrics[f"{stem_name}_energy"] / total_energy
                     )
-
-        # Add LLM confidence if available
-        if instrument_hints and "instruments" in instrument_hints:
-            instruments = instrument_hints.get("instruments", [])
-            if instruments:
-                avg_confidence = sum(
-                    inst.get("confidence", 0) for inst in instruments
-                ) / len(instruments)
-                metrics["llm_confidence"] = avg_confidence
 
         return metrics
 
@@ -572,6 +458,7 @@ class MVSEPSeparator:
                 "id": key,
                 "name": value["name"],
                 "stems": value["stems"],
+                "stem_names": value["stem_names"],
                 "description": value["description"]
             }
             for key, value in self.models.items()
@@ -581,7 +468,6 @@ class MVSEPSeparator:
         """Clean up resources and temporary files."""
         self.session.close()
 
-        # Clean temporary files
         temp_dir = Path("temp")
         if temp_dir.exists():
             for file in temp_dir.glob("*.wav"):

@@ -91,9 +91,9 @@ class EducationalAudioPipeline:
             "visualization": False,
             "analysis": True,
             "mvsep": {
-                "default_model": "ensemble_extra",
-                "max_stems": 7,
-                "use_llm_optimization": True,
+                "default_model": "ensemble_extra",  # Fixed to ensemble_extra
+                "max_stems": 6,  # 6 stems for ensemble_extra
+                "use_llm_optimization": False,  # Disabled LLM optimization
                 "api_timeout": 300,
                 "quality": "high"  # high/medium/fast
             },
@@ -202,9 +202,9 @@ class EducationalAudioPipeline:
             if interactive:
                 self._interactive_checkpoint("Audio loaded", audio_data)
 
-            # Stage 2: Source separation using MVSEP
+            # Stage 2: Source separation using MVSEP with ensemble_extra
             if mode in ["full", "learning", "separator"]:
-                self._print_stage("Source Separation (MVSEP)", "🎛️")
+                self._print_stage("Source Separation (MVSEP ensemble_extra)", "🎛️")
                 separated = self._separate_sources(audio_data, results, interactive)
 
                 if interactive:
@@ -287,44 +287,23 @@ class EducationalAudioPipeline:
         return audio_data
 
     def _separate_sources(self, audio_data: Dict, results: Dict, interactive: bool) -> Dict:
-        """Perform source separation using MVSEP."""
-        # Step 1: Extract advanced features for intelligent model selection
-        features = {}
-        if hasattr(self.analyzer, '_extract_spectral_features'):
-            features.update(self.analyzer._extract_spectral_features(
-                audio_data["waveform"].mean(dim=0).numpy() if audio_data["waveform"].dim() > 1
-                else audio_data["waveform"].numpy(),
-                audio_data["sample_rate"]
-            ))
-        if hasattr(self.analyzer, '_extract_harmonic_features'):
-            features.update(self.analyzer._extract_harmonic_features(
-                audio_data["waveform"].mean(dim=0).numpy() if audio_data["waveform"].dim() > 1
-                else audio_data["waveform"].numpy(),
-                audio_data["sample_rate"]
-            ))
+        """Perform source separation using MVSEP ensemble_extra model."""
 
-        # # Step 2: LLM classification for intelligent model selection
-        # classification = None
-        # model = self.config["mvsep"]["default_model"]
-        # stems = 4
-        #
-        # if self.assistant and features:
-        #     classification = self.assistant.classify_instruments(features)
-        #     if classification and "instruments" in classification:
-        #         # Let MVSEP's internal logic select the best model
-        #         self.console.print(
-        #             f"[cyan]Detected instruments: {', '.join([i['name'] for i in classification['instruments']])}[/cyan]")
+        # Use ensemble_extra model directly - no LLM classification
+        model = "ensemble_extra"
+        stems = 6  # ensemble_extra provides 6 stems
 
-        # Step 3: Run MVSEP separation
         input_path = Path(audio_data["filepath"])
 
         self.console.print(f"[yellow]Using MVSEP model: {model} with {stems} stems[/yellow]")
+        self.console.print(f"[cyan]Expected stems: vocals, drums, bass, piano, guitar, other[/cyan]")
 
+        # Run MVSEP separation with ensemble_extra
         separated = self.separator.separate(
             input_path,
             model=model,
             stems=stems,
-            instrument_hints=classification,
+            instrument_hints=None,  # No LLM hints
             progress_callback=self._progress_callback
         )
 
@@ -355,7 +334,7 @@ class EducationalAudioPipeline:
             "stems": stem_paths,
             "metrics": separated.get("metrics", {}),
             "processing_time": separated.get("processing_time", 0),
-            "llm_guided": separated.get("llm_guided", False)
+            "llm_guided": False  # No LLM used
         }
 
         # Educational insight about separation
@@ -568,33 +547,17 @@ def main():
     # Processing modes
     parser.add_argument("--mode", "-m",
                         choices=["full", "learning", "separator", "audiocraft", "style"],
-                        default="learning",
+                        default="separator",  # Default to separator mode for stem extraction
                         help="Processing mode")
-
-    # MVSEP Model selection
-    parser.add_argument("--mvsep-model", default="ensemble",
-                        choices=["ensemble", "ensemble_extra", "fast", "ultra_fast",
-                                 "vocal_instrumental", "karaoke", "drums_focus",
-                                 "piano", "guitar", "strings"],
-                        help="MVSEP model variant")
-    parser.add_argument("--mvsep-quality", default="high",
-                        choices=["high", "medium", "fast"],
-                        help="MVSEP processing quality")
-    parser.add_argument("--mvsep-stems", type=int, default=4,
-                        help="Number of stems to separate (2-7)")
-
-    # AudioCraft settings
-    parser.add_argument("--audiocraft-model", default="musicgen-medium",
-                        help="AudioCraft model to use")
 
     # Features
     parser.add_argument("--interactive", action="store_true",
                         help="Enable interactive learning mode")
-    parser.add_argument("--educational", action="store_true", default=True,
-                        help="Enable educational features (default: True)")
+    parser.add_argument("--educational", action="store_true", default=False,
+                        help="Enable educational features")
     parser.add_argument("--analyze", action="store_true", default=True,
                         help="Perform detailed analysis")
-    parser.add_argument("--visualize", action="store_true", default=True,
+    parser.add_argument("--visualize", action="store_true", default=False,
                         help="Generate visualizations")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output")
@@ -602,8 +565,6 @@ def main():
     # Batch processing
     parser.add_argument("--batch", type=Path,
                         help="Batch process directory")
-    parser.add_argument("--compare-models", action="store_true",
-                        help="Compare different model outputs")
 
     # API configuration
     parser.add_argument("--deepseek-api-key",
@@ -613,12 +574,12 @@ def main():
 
     # Print welcome banner
     console.print(Panel.fit(
-        "[bold magenta]Educational Audio Processing Pipeline[/bold magenta]\n"
-        "[dim]Learn advanced AI audio processing with state-of-the-art models[/dim]\n\n"
+        "[bold magenta]Audio Source Separation Pipeline[/bold magenta]\n"
+        "[dim]Extract 6 stems using MVSEP ensemble_extra model[/dim]\n\n"
         f"📂 Input: {args.input}\n"
         f"🎛️ Mode: {args.mode}\n"
-        f"🤖 Models: MVSEP + AudioCraft + DDSP",
-        title="🎵 Welcome to Audio AI Learning Lab",
+        f"🤖 Model: MVSEP ensemble_extra (6 stems: vocals, drums, bass, piano, guitar, other)",
+        title="🎵 Audio Stem Separation",
         border_style="magenta"
     ))
 
@@ -632,14 +593,14 @@ def main():
         "visualization": args.visualize,
         "analysis": args.analyze,
         "mvsep": {
-            "default_model": args.mvsep_model,
-            "quality": args.mvsep_quality,
-            "max_stems": args.mvsep_stems,
-            "use_llm_optimization": True,
+            "default_model": "ensemble_extra",  # Fixed to ensemble_extra
+            "quality": "high",
+            "max_stems": 6,
+            "use_llm_optimization": False,  # Disabled
             "api_timeout": 300,
         },
         "audiocraft": {
-            "model": args.audiocraft_model,
+            "model": "musicgen-medium",
             "use_sampling": True,
             "top_k": 250,
             "top_p": 0.0,
@@ -674,10 +635,6 @@ def main():
             console.print(f"\n[bold]Processing: {audio_file.name}[/bold]")
             results = pipeline.process_audio(audio_file, args.mode, args.interactive)
             results_list.append(results)
-
-        # Generate comparison report if requested
-        if args.compare_models:
-            pipeline.reporter.generate_comparison_report(results_list)
     else:
         # Single file processing
         results = pipeline.process_audio(args.input, args.mode, args.interactive)
