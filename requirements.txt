@@ -34,6 +34,7 @@ pandas>=2.0.0  # Data manipulation (for batch processing)
 requests>=2.28.0
 aiohttp>=3.8.0  # Async HTTP requests
 
+diffq
 # Development tools (optional - install with pip install -r requirements-dev.txt)
 # pytest>=7.0.0
 # black>=23.0.0

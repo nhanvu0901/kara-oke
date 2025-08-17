@@ -47,7 +47,10 @@ class AudioSeparationPipeline:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """Initialize the separation pipeline."""
-        self.config = config or self._default_config()
+        # Merge provided config with defaults
+        self.config = self._default_config()
+        if config:
+            self.config.update(config)
         self.console = console
         self._initialize_components()
 
@@ -533,7 +536,9 @@ Examples:
         "quality_mode": args.quality,
         "target_snr": args.snr_target,
         "device": args.device,
-        "blend_method": args.blend
+        "blend_method": args.blend,
+        "output_dir": Path("output"),  # Add default output directory
+        "temp_dir": Path("temp")  # Add default temp directory
     }
 
     if args.models:
@@ -570,7 +575,8 @@ Examples:
         if successful > 0:
             avg_snr = sum(r["metrics"]["reconstruction_snr"] for r in results if "error" not in r) / successful
             console.print(f"Average SNR: {avg_snr:.3f} dB")
-            console.print(f"Output: {config.get('output_dir', Path('output'))}/separated/")
+            # Use pipeline's config for output_dir
+            console.print(f"Output: {pipeline.config['output_dir']}/separated/")
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Processing cancelled[/yellow]")

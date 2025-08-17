@@ -158,7 +158,8 @@ class EnsembleSourceSeparator:
 
     def _get_ensemble_models(self) -> List[str]:
         """Get list of models to use based on quality mode."""
-        if "ensemble_models" in self.config:
+        # Only use config ensemble_models if it's not None and not empty
+        if self.config.get("ensemble_models"):
             return self.config["ensemble_models"]
 
         if self.quality_mode == "highest":
