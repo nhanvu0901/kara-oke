@@ -72,6 +72,182 @@ class AudioLoader:
         Load and preprocess audio file.
 
         Args:
+            file_path: Path to audio file
+
+        Returns:
+            Dictionary containing audio data and metadata
+        """
+        if not file_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {file_path}")
+
+        file_ext = file_path.suffix.lower()
+
+        # Log loading
+        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+        logger.info(f"Loading: {file_path.name} ({file_size_mb:.1f}MB, format: {file_ext})")
+
+        # Try loading with different backends
+        waveform, sample_rate = None, None
+        load_error = None
+
+        # Try torchaudio first (fastest for supported formats)
+        if file_ext in self.TORCHAUDIO_FORMATS:
+            try:
+                waveform, sample_rate = self._load_with_torchaudio(file_path)
+            except Exception as e:
+                load_error = e
+                logger.debug(f"Torchaudio failed: {e}")
+
+        # Try soundfile if available
+        if waveform is None and SOUNDFILE_AVAILABLE and file_ext in self.SOUNDFILE_FORMATS:
+            try:
+                waveform, sample_rate = self._load_with_soundfile(file_path)
+            except Exception as e:
+                load_error = e
+                logger.debug(f"Soundfile failed: {e}")
+
+        # Try pydub as fallback (supports most formats but slower)
+        if waveform is None and PYDUB_AVAILABLE:
+            try:
+                waveform, sample_rate = self._load_with_pydub(file_path)
+            except Exception as e:
+                load_error = e
+                logger.debug(f"Pydub failed: {e}")
+
+        # Final torchaudio attempt for any format
+        if waveform is None:
+            try:
+                waveform, sample_rate = self._load_with_torchaudio(file_path)
+            except Exception as e:
+                load_error = e
+
+        if waveform is None:
+            raise RuntimeError(f"Failed to load audio file: {load_error}")
+
+        # Preprocess audio
+        waveform, sample_rate = self._preprocess(waveform, sample_rate)
+
+        # Calculate metadata
+        duration = waveform.shape[-1] / sample_rate
+        channels = waveform.shape[0] if waveform.dim() > 1 else 1
+
+        # Check for potential issues
+        max_amplitude = torch.max(torch.abs(waveform)).item()
+        is_clipped = max_amplitude > 0.99
+
+        if is_clipped:
+            logger.warning(f"Audio may be clipped (max amplitude: {max_amplitude:.3f})")
+
+        # DC offset check
+        dc_offset = torch.mean(waveform).item()
+        if abs(dc_offset) > 0.01:
+            logger.info(f"DC offset detected: {dc_offset:.4f}, removing...")
+            waveform = waveform - dc_offset
+
+        return {
+            "waveform": waveform,
+            "sample_rate": sample_rate,
+            "duration": duration,
+            "channels": channels,
+            "samples": waveform.shape[-1],
+            "format": file_ext[1:],
+            "filename": file_path.stem,
+            "filepath": str(file_path),
+            "max_amplitude": max_amplitude,
+            "is_clipped": is_clipped,
+            "file_size_mb": file_size_mb
+        }
+
+    def _load_with_torchaudio(self, file_path: Path) -> Tuple[torch.Tensor, int]:
+        """Load audio using torchaudio."""
+        waveform, sample_rate = torchaudio.load(str(file_path))
+        return waveform, sample_rate
+
+    def _load_with_soundfile(self, file_path: Path) -> Tuple[torch.Tensor, int]:
+        """Load audio using soundfile."""
+        data, sample_rate = sf.read(str(file_path), always_2d=True)
+        # Soundfile returns (samples, channels), convert to (channels, samples)
+        waveform = torch.from_numpy(data.T).float()
+        return waveform, sample_rate
+
+    def _load_with_pydub(self, file_path: Path) -> Tuple[torch.Tensor, int]:
+        """Load audio using pydub."""
+        audio = AudioSegment.from_file(str(file_path))
+
+        # Convert to numpy array
+        samples = np.array(audio.get_array_of_samples())
+
+        # Reshape based on channels
+        if audio.channels == 2:
+            samples = samples.reshape((-1, 2)).T
+        else:
+            samples = samples.reshape(1, -1)
+
+        # Convert to float32 and normalize
+        max_val = 2 ** (audio.sample_width * 8 - 1)
+        samples = samples.astype(np.float32) / max_val
+
+        waveform = torch.from_numpy(samples)
+        sample_rate = audio.frame_rate
+
+        return waveform, sample_rate
+
+    def _preprocess(self, waveform: torch.Tensor, sample_rate: int) -> Tuple[torch.Tensor, int]:
+        """Preprocess audio for optimal separation."""
+        # Ensure 2D tensor [channels, samples]
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+
+        # Limit length if specified
+        if self.max_length and waveform.shape[-1] > self.max_length * sample_rate:
+            max_samples = int(self.max_length * sample_rate)
+            logger.info(f"Truncating audio to {self.max_length} seconds")
+            waveform = waveform[:, :max_samples]
+
+        # Resample if needed
+        if sample_rate != self.target_sr:
+            logger.info(f"Resampling from {sample_rate}Hz to {self.target_sr}Hz")
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=sample_rate,
+                new_freq=self.target_sr,
+                resampling_method="kaiser_window"
+            )
+            waveform = resampler(waveform)
+            sample_rate = self.target_sr
+
+        # Convert to stereo if requested and not already
+        if self.convert_to_stereo:
+            if waveform.shape[0] == 1:
+                # Mono to stereo
+                waveform = waveform.repeat(2, 1)
+                logger.debug("Converted mono to stereo")
+            elif waveform.shape[0] > 2:
+                # Multichannel to stereo
+                waveform = waveform[:2, :]
+                logger.debug(f"Reduced {waveform.shape[0]} channels to stereo")
+
+        # Normalize if requested
+        if self.normalize:
+            max_val = torch.max(torch.abs(waveform))
+            if max_val > 0:
+                target_peak = 0.95  # Leave some headroom
+                waveform = waveform * (target_peak / max_val)
+                logger.debug(f"Normalized audio (peak: {max_val:.3f} -> {target_peak})")
+
+        return waveform, sample_rate
+
+    def save(self,
+             waveform: torch.Tensor,
+             sample_rate: int,
+             file_path: Path,
+             format: Optional[str] = None,
+             bits_per_sample: Optional[int] = None) -> None:
+        """
+        Save audio to file.
+
+        Args:
+            waveform: Audio tensor [channels, samples]
+            sample_rate: Sample rate in Hz
             file_path: Output file path
             format: Output format (inferred from extension if None)
             bits_per_sample: Bit depth for WAV files (16, 24, or 32)
@@ -470,183 +646,4 @@ class AudioLoader:
         stats["num_samples"] = waveform.shape[-1]
         stats["sample_rate"] = sample_rate
 
-        return stats Path to audio file
-
-        Returns:
-            Dictionary containing audio data and metadata
-        """
-        if not file_path.exists():
-            raise FileNotFoundError(f"Audio file not found: {file_path}")
-            
-        file_ext = file_path.suffix.lower()
-        
-        # Log loading
-        file_size_mb = file_path.stat().st_size / (1024 * 1024)
-        logger.info(f"Loading: {file_path.name} ({file_size_mb:.1f}MB, format: {file_ext})")
-        
-        # Try loading with different backends
-        waveform, sample_rate = None, None
-        load_error = None
-        
-        # Try torchaudio first (fastest for supported formats)
-        if file_ext in self.TORCHAUDIO_FORMATS:
-            try:
-                waveform, sample_rate = self._load_with_torchaudio(file_path)
-            except Exception as e:
-                load_error = e
-                logger.debug(f"Torchaudio failed: {e}")
-        
-        # Try soundfile if available
-        if waveform is None and SOUNDFILE_AVAILABLE and file_ext in self.SOUNDFILE_FORMATS:
-            try:
-                waveform, sample_rate = self._load_with_soundfile(file_path)
-            except Exception as e:
-                load_error = e
-                logger.debug(f"Soundfile failed: {e}")
-        
-        # Try pydub as fallback (supports most formats but slower)
-        if waveform is None and PYDUB_AVAILABLE:
-            try:
-                waveform, sample_rate = self._load_with_pydub(file_path)
-            except Exception as e:
-                load_error = e
-                logger.debug(f"Pydub failed: {e}")
-        
-        # Final torchaudio attempt for any format
-        if waveform is None:
-            try:
-                waveform, sample_rate = self._load_with_torchaudio(file_path)
-            except Exception as e:
-                load_error = e
-        
-        if waveform is None:
-            raise RuntimeError(f"Failed to load audio file: {load_error}")
-        
-        # Preprocess audio
-        waveform, sample_rate = self._preprocess(waveform, sample_rate)
-        
-        # Calculate metadata
-        duration = waveform.shape[-1] / sample_rate
-        channels = waveform.shape[0] if waveform.dim() > 1 else 1
-        
-        # Check for potential issues
-        max_amplitude = torch.max(torch.abs(waveform)).item()
-        is_clipped = max_amplitude > 0.99
-        
-        if is_clipped:
-            logger.warning(f"Audio may be clipped (max amplitude: {max_amplitude:.3f})")
-        
-        # DC offset check
-        dc_offset = torch.mean(waveform).item()
-        if abs(dc_offset) > 0.01:
-            logger.info(f"DC offset detected: {dc_offset:.4f}, removing...")
-            waveform = waveform - dc_offset
-        
-        return {
-            "waveform": waveform,
-            "sample_rate": sample_rate,
-            "duration": duration,
-            "channels": channels,
-            "samples": waveform.shape[-1],
-            "format": file_ext[1:],
-            "filename": file_path.stem,
-            "filepath": str(file_path),
-            "max_amplitude": max_amplitude,
-            "is_clipped": is_clipped,
-            "file_size_mb": file_size_mb
-        }
-    
-    def _load_with_torchaudio(self, file_path: Path) -> Tuple[torch.Tensor, int]:
-        """Load audio using torchaudio."""
-        waveform, sample_rate = torchaudio.load(str(file_path))
-        return waveform, sample_rate
-    
-    def _load_with_soundfile(self, file_path: Path) -> Tuple[torch.Tensor, int]:
-        """Load audio using soundfile."""
-        data, sample_rate = sf.read(str(file_path), always_2d=True)
-        # Soundfile returns (samples, channels), convert to (channels, samples)
-        waveform = torch.from_numpy(data.T).float()
-        return waveform, sample_rate
-    
-    def _load_with_pydub(self, file_path: Path) -> Tuple[torch.Tensor, int]:
-        """Load audio using pydub."""
-        audio = AudioSegment.from_file(str(file_path))
-        
-        # Convert to numpy array
-        samples = np.array(audio.get_array_of_samples())
-        
-        # Reshape based on channels
-        if audio.channels == 2:
-            samples = samples.reshape((-1, 2)).T
-        else:
-            samples = samples.reshape(1, -1)
-        
-        # Convert to float32 and normalize
-        max_val = 2 ** (audio.sample_width * 8 - 1)
-        samples = samples.astype(np.float32) / max_val
-        
-        waveform = torch.from_numpy(samples)
-        sample_rate = audio.frame_rate
-        
-        return waveform, sample_rate
-    
-    def _preprocess(self, waveform: torch.Tensor, sample_rate: int) -> Tuple[torch.Tensor, int]:
-        """Preprocess audio for optimal separation."""
-        # Ensure 2D tensor [channels, samples]
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-
-        # Limit length if specified
-        if self.max_length and waveform.shape[-1] > self.max_length * sample_rate:
-            max_samples = int(self.max_length * sample_rate)
-            logger.info(f"Truncating audio to {self.max_length} seconds")
-            waveform = waveform[:, :max_samples]
-
-        # Resample if needed
-        if sample_rate != self.target_sr:
-            logger.info(f"Resampling from {sample_rate}Hz to {self.target_sr}Hz")
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate,
-                new_freq=self.target_sr,
-                resampling_method="kaiser_window"
-            )
-            waveform = resampler(waveform)
-            sample_rate = self.target_sr
-
-        # Convert to stereo if requested and not already
-        if self.convert_to_stereo:
-            if waveform.shape[0] == 1:
-                # Mono to stereo
-                waveform = waveform.repeat(2, 1)
-                logger.debug("Converted mono to stereo")
-            elif waveform.shape[0] > 2:
-                # Multichannel to stereo
-                waveform = waveform[:2, :]
-                logger.debug(f"Reduced {waveform.shape[0]} channels to stereo")
-
-        # Normalize if requested
-        if self.normalize:
-            max_val = torch.max(torch.abs(waveform))
-            if max_val > 0:
-                target_peak = 0.95  # Leave some headroom
-                waveform = waveform * (target_peak / max_val)
-                logger.debug(f"Normalized audio (peak: {max_val:.3f} -> {target_peak})")
-
-        return waveform, sample_rate
-
-    def save(self,
-             waveform: torch.Tensor,
-             sample_rate: int,
-             file_path: Path,
-             format: Optional[str] = None,
-             bits_per_sample: Optional[int] = None) -> None:
-        """
-        Save audio to file.
-
-        Args:
-            waveform: Audio tensor [channels, samples]
-            sample_rate: Sample rate in Hz
-            file_path: Output file path
-            format: Output format (inferred from extension if None)
-            bits_per_sample: Bit depth for WAV files (16, 24, or 32)
-        """
+        return stats
