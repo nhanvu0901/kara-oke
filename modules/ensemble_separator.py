@@ -1,17 +1,25 @@
+"""
+Enhanced Ensemble Source Separator
+==================================
+Production-ready ensemble separator combining multiple state-of-the-art models
+for high-quality audio source separation with SNR > 0.20 target.
+"""
+
 import torch
 import torchaudio
 import numpy as np
 from pathlib import Path
-from typing import Dict, Optional, Callable, List, Tuple
+from typing import Dict, Optional, Callable, List, Tuple, Union
 import logging
 import time
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from dataclasses import dataclass
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-# Import required libraries with fallbacks
+# Import separation models
 try:
     from demucs import pretrained
     from demucs.apply import apply_model
@@ -19,7 +27,7 @@ try:
 
     DEMUCS_AVAILABLE = True
 except ImportError:
-    logger.warning("Demucs not available. Install with: pip install demucs")
+    logger.error("Demucs not installed. Install with: pip install demucs")
     DEMUCS_AVAILABLE = False
 
 try:
@@ -27,81 +35,194 @@ try:
 
     LIBROSA_AVAILABLE = True
 except ImportError:
-    logger.warning("Librosa not available. Install with: pip install librosa")
+    logger.warning("Librosa not installed. Some features will be limited.")
     LIBROSA_AVAILABLE = False
+
+
+class SeparationModel(Enum):
+    """Available separation models."""
+    HTDEMUCS_6S = "htdemucs_6s"  # 6-stem high quality
+    HTDEMUCS_FT = "htdemucs_ft"  # Fine-tuned 4-stem
+    HTDEMUCS = "htdemucs"  # Standard 4-stem
+    MDX_EXTRA_Q = "mdx_extra_q"  # MDX high quality
+    MDX23C = "mdx23c_musdb18"  # Latest MDX variant
+
+
+@dataclass
+class ModelConfig:
+    """Configuration for a separation model."""
+    name: str
+    weight: float
+    stems: int
+    quality_score: float
+    optimal_for: List[str]
+
+
+class ModelRegistry:
+    """Registry of available models with their configurations."""
+
+    MODELS = {
+        SeparationModel.HTDEMUCS_6S: ModelConfig(
+            name="htdemucs_6s",
+            weight=1.0,
+            stems=6,
+            quality_score=0.95,
+            optimal_for=["vocals", "drums", "bass", "piano", "guitar", "other"]
+        ),
+        SeparationModel.HTDEMUCS_FT: ModelConfig(
+            name="htdemucs_ft",
+            weight=0.85,
+            stems=4,
+            quality_score=0.90,
+            optimal_for=["vocals", "drums", "bass", "other"]
+        ),
+        SeparationModel.HTDEMUCS: ModelConfig(
+            name="htdemucs",
+            weight=0.70,
+            stems=4,
+            quality_score=0.80,
+            optimal_for=["vocals", "drums", "bass", "other"]
+        ),
+        SeparationModel.MDX_EXTRA_Q: ModelConfig(
+            name="mdx_extra_q",
+            weight=0.90,
+            stems=4,
+            quality_score=0.88,
+            optimal_for=["vocals", "instrumental"]
+        ),
+        SeparationModel.MDX23C: ModelConfig(
+            name="mdx23c_musdb18",
+            weight=0.85,
+            stems=4,
+            quality_score=0.87,
+            optimal_for=["vocals", "drums", "bass", "other"]
+        )
+    }
 
 
 class EnsembleSourceSeparator:
     """
-    High-quality ensemble source separator combining multiple models.
-    Focuses on achieving SNR > 0.20 through model ensemble and advanced blending.
+    Production-ready ensemble source separator combining multiple models
+    for optimal separation quality (target SNR > 0.20).
     """
 
     def __init__(self, config: Dict):
-        self.config = config
-        self.device = config.get("device", "mps" if torch.backends.mps.is_available() else "cpu")
-        self.models = {}
-        self.model_weights = {}
+        """
+        Initialize the ensemble separator.
 
-        # Extended timeout for quality processing
-        self.timeout = config.get("timeout", 1800)  # 30 minutes default
+        Args:
+            config: Configuration dictionary
+        """
+        self.config = config
+        self.device = self._setup_device(config.get("device", "auto"))
+        self.models = {}
+        self.model_configs = {}
+
+        # Performance settings
+        self.timeout = config.get("timeout", 1800)
+        self.max_parallel_models = config.get("max_parallel_models", 2)
+        self.chunk_size = config.get("chunk_size", None)  # For memory-limited processing
 
         # Quality settings
         self.quality_mode = config.get("quality_mode", "highest")
         self.target_snr = config.get("target_snr", 0.20)
 
         # Ensemble configuration
-        self.ensemble_models = config.get("ensemble_models", [
-            "htdemucs_6s",  # Best overall quality
-            "htdemucs_ft",  # Fine-tuned version
-            "mdx_extra_q",  # High-quality MDX
-            "mdx23c_musdb18"  # Latest MDX variant
-        ])
-
+        self.ensemble_models = self._get_ensemble_models()
         self.blend_method = config.get("blend_method", "weighted_average")
         self.use_frequency_weighting = config.get("use_frequency_weighting", True)
+
+        # Cache for model outputs (memory optimization)
+        self.enable_cache = config.get("enable_cache", True)
+        self.model_cache = {} if self.enable_cache else None
 
         # Load models
         self._load_models()
 
+    def _setup_device(self, device_config: str) -> str:
+        """Setup the compute device."""
+        if device_config == "auto":
+            if torch.backends.mps.is_available():
+                device = "mps"
+                logger.info("Using Apple Silicon MPS acceleration")
+            elif torch.cuda.is_available():
+                device = "cuda"
+                logger.info(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+            else:
+                device = "cpu"
+                logger.info("Using CPU (consider GPU for better performance)")
+        else:
+            device = device_config
+
+        return device
+
+    def _get_ensemble_models(self) -> List[str]:
+        """Get list of models to use based on quality mode."""
+        if "ensemble_models" in self.config:
+            return self.config["ensemble_models"]
+
+        if self.quality_mode == "highest":
+            return ["htdemucs_6s", "htdemucs_ft", "mdx_extra_q"]
+        elif self.quality_mode == "high":
+            return ["htdemucs_ft", "mdx23c_musdb18"]
+        elif self.quality_mode == "balanced":
+            return ["htdemucs_ft"]
+        else:  # fast
+            return ["htdemucs"]
+
     def _load_models(self):
-        """Load all available models for ensemble processing."""
-        logger.info("Loading ensemble models for high-quality separation...")
-
+        """Load all models in the ensemble."""
         if not DEMUCS_AVAILABLE:
-            logger.error("Demucs is required for ensemble separation")
-            raise RuntimeError("Demucs not available")
+            raise RuntimeError("Demucs is required for source separation")
 
-        # Available Demucs models with quality ratings
-        available_models = {
-            "htdemucs_6s": {"weight": 1.0, "stems": 6},  # Highest quality
-            "htdemucs_ft": {"weight": 0.8, "stems": 4},  # Fine-tuned
-            "htdemucs": {"weight": 0.6, "stems": 4},  # Standard
-            "mdx_extra_q": {"weight": 0.9, "stems": 4},  # MDX high quality
-            "mdx23c_musdb18": {"weight": 0.85, "stems": 4}  # Latest MDX
-        }
+        logger.info(f"Loading ensemble models for {self.quality_mode} quality mode...")
+
+        successful_loads = 0
+        failed_loads = []
 
         for model_name in self.ensemble_models:
-            if model_name in available_models:
-                try:
-                    logger.info(f"Loading {model_name}...")
-                    model = pretrained.get_model(model_name)
-                    model.to(self.device)
-                    model.eval()
+            try:
+                # Get model config
+                model_enum = None
+                for enum_val in SeparationModel:
+                    if enum_val.value == model_name:
+                        model_enum = enum_val
+                        break
 
-                    self.models[model_name] = model
-                    self.model_weights[model_name] = available_models[model_name]["weight"]
-
-                    logger.info(f"✓ {model_name} loaded (weight: {available_models[model_name]['weight']})")
-
-                except Exception as e:
-                    logger.warning(f"Failed to load {model_name}: {e}")
+                if not model_enum:
+                    logger.warning(f"Unknown model: {model_name}")
                     continue
 
-        if not self.models:
-            raise RuntimeError("No models could be loaded for ensemble separation")
+                model_config = ModelRegistry.MODELS[model_enum]
 
-        logger.info(f"Ensemble ready with {len(self.models)} models")
+                logger.info(
+                    f"Loading {model_name} (stems: {model_config.stems}, quality: {model_config.quality_score:.2f})...")
+
+                # Load the model
+                model = pretrained.get_model(model_name)
+
+                # Move to device
+                model.to(self.device)
+                model.eval()
+
+                # Store model and config
+                self.models[model_name] = model
+                self.model_configs[model_name] = model_config
+
+                successful_loads += 1
+                logger.info(f"✓ {model_name} loaded successfully")
+
+            except Exception as e:
+                logger.error(f"✗ Failed to load {model_name}: {str(e)}")
+                failed_loads.append(model_name)
+
+        if successful_loads == 0:
+            raise RuntimeError("No models could be loaded")
+
+        logger.info(f"Ensemble ready: {successful_loads} models loaded, {len(failed_loads)} failed")
+
+        if failed_loads:
+            logger.warning(f"Failed models: {', '.join(failed_loads)}")
 
     def separate(self,
                  waveform: torch.Tensor,
@@ -111,95 +232,132 @@ class EnsembleSourceSeparator:
         Perform high-quality ensemble source separation.
 
         Args:
-            waveform: Input audio tensor
-            sample_rate: Sample rate
-            progress_callback: Progress callback function
+            waveform: Input audio tensor [channels, samples]
+            sample_rate: Sample rate in Hz
+            progress_callback: Optional callback(progress: float, message: str)
 
         Returns:
-            Dictionary with separated stems and quality metrics
+            Dictionary containing separated stems and metrics
         """
         start_time = time.time()
 
-        if progress_callback:
-            progress_callback(0.05, "Initializing ensemble separation...")
+        try:
+            # Validate input
+            if waveform.dim() not in [1, 2]:
+                raise ValueError(f"Expected 1D or 2D tensor, got {waveform.dim()}D")
 
-        # Prepare audio for processing
-        processed_audio = self._preprocess_audio(waveform, sample_rate)
+            if progress_callback:
+                progress_callback(0.05, "Preprocessing audio...")
 
-        # Run models in parallel for speed
-        model_results = self._run_ensemble_models(processed_audio, progress_callback)
+            # Preprocess audio
+            processed_audio, original_sr = self._preprocess_audio(waveform, sample_rate)
 
-        if progress_callback:
-            progress_callback(0.80, "Blending ensemble results...")
+            # Clear cache if enabled
+            if self.enable_cache:
+                self.model_cache.clear()
 
-        # Blend results using advanced techniques
-        final_stems = self._blend_ensemble_results(model_results, processed_audio)
+            # Run ensemble models
+            if progress_callback:
+                progress_callback(0.10, f"Running {len(self.models)} models...")
 
-        if progress_callback:
-            progress_callback(0.95, "Calculating quality metrics...")
+            model_results = self._run_ensemble_models(processed_audio, progress_callback)
 
-        # Calculate comprehensive metrics
-        metrics = self._calculate_advanced_metrics(processed_audio, final_stems)
+            if not model_results:
+                raise RuntimeError("No models produced results")
 
-        # Post-process stems for optimal quality
-        final_stems = self._postprocess_stems(final_stems, sample_rate)
+            # Blend results
+            if progress_callback:
+                progress_callback(0.80, "Blending ensemble results...")
 
-        processing_time = time.time() - start_time
+            final_stems = self._blend_ensemble_results(model_results, processed_audio)
 
-        if progress_callback:
-            progress_callback(1.0, f"Complete! SNR: {metrics.get('reconstruction_snr', 0):.3f}")
+            # Calculate metrics
+            if progress_callback:
+                progress_callback(0.90, "Calculating quality metrics...")
 
-        return {
-            "stems": final_stems,
-            "source_names": list(final_stems.keys()),
-            "metrics": metrics,
-            "processing_time": processing_time,
-            "ensemble_info": {
-                "models_used": list(self.models.keys()),
-                "blend_method": self.blend_method,
-                "quality_mode": self.quality_mode
+            metrics = self._calculate_metrics(processed_audio, final_stems)
+
+            # Post-process stems
+            if progress_callback:
+                progress_callback(0.95, "Finalizing output...")
+
+            final_stems = self._postprocess_stems(final_stems, original_sr, sample_rate)
+
+            processing_time = time.time() - start_time
+
+            # Prepare results
+            results = {
+                "stems": final_stems,
+                "source_names": list(final_stems.keys()),
+                "metrics": metrics,
+                "processing_time": processing_time,
+                "ensemble_info": {
+                    "models_used": list(model_results.keys()),
+                    "blend_method": self.blend_method,
+                    "quality_mode": self.quality_mode,
+                    "device": self.device
+                }
             }
-        }
 
-    def _preprocess_audio(self, waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
-        """Preprocess audio for optimal separation quality."""
-        # Ensure stereo
+            if progress_callback:
+                snr = metrics.get("reconstruction_snr", 0)
+                progress_callback(1.0, f"Complete! SNR: {snr:.3f} dB")
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Separation failed: {str(e)}")
+            raise
+
+    def _preprocess_audio(self, waveform: torch.Tensor, sample_rate: int) -> Tuple[torch.Tensor, int]:
+        """Preprocess audio for optimal separation."""
+        original_sr = sample_rate
+
+        # Ensure 2D tensor [channels, samples]
         if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0).repeat(2, 1)
-        elif waveform.shape[0] == 1:
+            waveform = waveform.unsqueeze(0)
+
+        # Convert to stereo if mono
+        if waveform.shape[0] == 1:
             waveform = waveform.repeat(2, 1)
+        elif waveform.shape[0] > 2:
+            # Mix down to stereo if more than 2 channels
+            waveform = waveform[:2, :]
 
-        # Normalize to prevent clipping while preserving dynamics
+        # Normalize to prevent clipping
         max_val = torch.max(torch.abs(waveform))
-        if max_val > 0.95:
-            waveform = waveform * (0.95 / max_val)
+        if max_val > 0:
+            waveform = waveform / max_val * 0.95
 
-        # Apply gentle high-pass filter to remove subsonic content
-        if LIBROSA_AVAILABLE and sample_rate != 44100:
-            # Resample to standard rate for consistency
+        # Resample to 44100 Hz for consistency across models
+        if sample_rate != 44100:
             resampler = torchaudio.transforms.Resample(sample_rate, 44100)
             waveform = resampler(waveform)
 
-        return waveform
+        return waveform, original_sr
 
     def _run_ensemble_models(self, audio: torch.Tensor, progress_callback: Optional[Callable]) -> Dict:
         """Run all models in the ensemble."""
         model_results = {}
         total_models = len(self.models)
 
-        # Use ThreadPoolExecutor for parallel processing if multiple models
-        if len(self.models) > 1:
-            model_results = self._run_models_parallel(audio, progress_callback)
-        else:
-            # Single model execution
+        if total_models == 0:
+            raise RuntimeError("No models loaded")
+
+        # Single model or sequential processing
+        if total_models == 1 or self.max_parallel_models == 1:
             for i, (model_name, model) in enumerate(self.models.items()):
                 if progress_callback:
-                    progress = 0.1 + (0.7 * i / total_models)
+                    progress = 0.10 + (0.70 * (i + 1) / total_models)
                     progress_callback(progress, f"Processing with {model_name}...")
 
                 result = self._run_single_model(model, audio, model_name)
                 if result:
                     model_results[model_name] = result
+
+        else:
+            # Parallel processing
+            model_results = self._run_models_parallel(audio, progress_callback)
 
         return model_results
 
@@ -208,8 +366,6 @@ class EnsembleSourceSeparator:
         model_results = {}
         completed_count = 0
         total_models = len(self.models)
-
-        # Create a lock for thread-safe progress updates
         progress_lock = threading.Lock()
 
         def update_progress():
@@ -217,17 +373,15 @@ class EnsembleSourceSeparator:
             with progress_lock:
                 completed_count += 1
                 if progress_callback:
-                    progress = 0.1 + (0.7 * completed_count / total_models)
+                    progress = 0.10 + (0.70 * completed_count / total_models)
                     progress_callback(progress, f"Completed {completed_count}/{total_models} models")
 
-        with ThreadPoolExecutor(max_workers=min(len(self.models), 3)) as executor:
-            # Submit all model tasks
+        with ThreadPoolExecutor(max_workers=min(self.max_parallel_models, total_models)) as executor:
             future_to_model = {
                 executor.submit(self._run_single_model, model, audio, model_name): model_name
                 for model_name, model in self.models.items()
             }
 
-            # Collect results as they complete
             for future in as_completed(future_to_model):
                 model_name = future_to_model[future]
                 try:
@@ -236,196 +390,231 @@ class EnsembleSourceSeparator:
                         model_results[model_name] = result
                     update_progress()
                 except Exception as e:
-                    logger.warning(f"Model {model_name} failed: {e}")
+                    logger.error(f"Model {model_name} failed: {str(e)}")
                     update_progress()
 
         return model_results
 
     def _run_single_model(self, model, audio: torch.Tensor, model_name: str) -> Optional[Dict]:
-        """Run a single model and return results."""
+        """Run a single separation model."""
         try:
-            # Convert audio for the specific model
+            # Check cache first
+            if self.enable_cache and model_name in self.model_cache:
+                logger.info(f"Using cached result for {model_name}")
+                return self.model_cache[model_name]
+
+            # Prepare audio for model
             model_audio = convert_audio(
                 audio.unsqueeze(0),  # Add batch dimension
-                44100,  # Assume preprocessed to 44100
+                44100,  # Input sample rate
                 model.samplerate,
                 model.audio_channels
             )
 
-            # Apply model with no gradient computation
+            # Move to device
+            model_audio = model_audio.to(self.device)
+
+            # Apply model
             with torch.no_grad():
                 sources = apply_model(
                     model,
                     model_audio,
                     device=self.device,
                     progress=False,
-                    num_workers=0  # Avoid conflicts in parallel execution
+                    num_workers=0
                 )
 
             # Extract stems
             stems = {}
-            source_names = model.sources
+            for i, name in enumerate(model.sources):
+                stem_audio = sources[0, i].cpu()  # Remove batch dim and move to CPU
 
-            for i, name in enumerate(source_names):
-                stem_audio = sources[0, i]  # Remove batch dimension
-
-                # Convert back to original sample rate if needed
+                # Resample back to 44100 if needed
                 if model.samplerate != 44100:
                     resampler = torchaudio.transforms.Resample(model.samplerate, 44100)
                     stem_audio = resampler(stem_audio)
 
                 stems[name] = stem_audio
 
-            return {
+            result = {
                 "stems": stems,
-                "source_names": source_names,
-                "model_name": model_name,
-                "weight": self.model_weights[model_name]
+                "source_names": model.sources,
+                "model_config": self.model_configs[model_name]
             }
 
+            # Cache result if enabled
+            if self.enable_cache:
+                self.model_cache[model_name] = result
+
+            return result
+
         except Exception as e:
-            logger.error(f"Model {model_name} processing failed: {e}")
+            logger.error(f"Error running {model_name}: {str(e)}")
             return None
 
     def _blend_ensemble_results(self, model_results: Dict, original_audio: torch.Tensor) -> Dict:
         """Blend results from multiple models using advanced techniques."""
-        if not model_results:
-            raise RuntimeError("No model results to blend")
-
         if len(model_results) == 1:
-            # Single model result
+            # Single model, no blending needed
             return list(model_results.values())[0]["stems"]
 
-        # Collect all stem names
-        all_stem_names = set()
+        # Collect all unique stem names
+        all_stems = set()
         for result in model_results.values():
-            all_stem_names.update(result["stems"].keys())
+            all_stems.update(result["stems"].keys())
 
-        # Normalize stem names (handle variations)
-        stem_mapping = self._create_stem_mapping(all_stem_names)
+        # Create stem mapping for normalization
+        stem_mapping = self._create_stem_mapping(all_stems)
 
         blended_stems = {}
 
-        for canonical_name in stem_mapping.keys():
-            blended_stems[canonical_name] = self._blend_single_stem(
-                canonical_name, stem_mapping[canonical_name], model_results, original_audio
-            )
+        for canonical_name, variations in stem_mapping.items():
+            stem_data = self._collect_stem_data(canonical_name, variations, model_results)
+
+            if stem_data:
+                if self.blend_method == "weighted_average":
+                    blended = self._weighted_average_blend(stem_data)
+                elif self.blend_method == "median":
+                    blended = self._median_blend(stem_data)
+                elif self.blend_method == "frequency_weighted":
+                    blended = self._frequency_weighted_blend(stem_data)
+                else:
+                    blended = self._weighted_average_blend(stem_data)
+
+                blended_stems[canonical_name] = blended
 
         return blended_stems
 
-    def _create_stem_mapping(self, stem_names: set) -> Dict:
-        """Create mapping from canonical stem names to variations."""
-        canonical_mapping = {
-            "vocals": ["vocals", "vocal", "voice"],
-            "drums": ["drums", "drum"],
-            "bass": ["bass"],
-            "other": ["other", "accompaniment", "rest"],
-            "piano": ["piano"],
-            "guitar": ["guitar"]
+    def _create_stem_mapping(self, stem_names: set) -> Dict[str, List[str]]:
+        """Create mapping from canonical names to variations."""
+        mapping = {
+            "vocals": [],
+            "drums": [],
+            "bass": [],
+            "other": [],
+            "piano": [],
+            "guitar": []
         }
 
-        stem_mapping = {}
+        for stem in stem_names:
+            stem_lower = stem.lower()
+            if "vocal" in stem_lower or "voice" in stem_lower:
+                mapping["vocals"].append(stem)
+            elif "drum" in stem_lower:
+                mapping["drums"].append(stem)
+            elif "bass" in stem_lower:
+                mapping["bass"].append(stem)
+            elif "piano" in stem_lower:
+                mapping["piano"].append(stem)
+            elif "guitar" in stem_lower:
+                mapping["guitar"].append(stem)
+            else:
+                mapping["other"].append(stem)
 
-        for canonical, variations in canonical_mapping.items():
-            mapped_names = []
-            for stem_name in stem_names:
-                if stem_name.lower() in variations:
-                    mapped_names.append(stem_name)
+        # Remove empty mappings
+        return {k: v for k, v in mapping.items() if v}
 
-            if mapped_names:
-                stem_mapping[canonical] = mapped_names
+    def _collect_stem_data(self, canonical_name: str, variations: List[str],
+                           model_results: Dict) -> List[Tuple[torch.Tensor, float]]:
+        """Collect all versions of a stem with their weights."""
+        stem_data = []
 
-        return stem_mapping
-
-    def _blend_single_stem(self, canonical_name: str, stem_variations: List[str],
-                           model_results: Dict, original_audio: torch.Tensor) -> torch.Tensor:
-        """Blend a single stem type across all models."""
-        stem_tensors = []
-        weights = []
-
-        # Collect all versions of this stem
         for model_name, result in model_results.items():
-            model_weight = result["weight"]
+            model_config = result["model_config"]
 
-            for variation in stem_variations:
+            for variation in variations:
                 if variation in result["stems"]:
                     stem_tensor = result["stems"][variation]
 
-                    # Quality-based weighting
-                    quality_weight = self._calculate_stem_quality_weight(
-                        stem_tensor, original_audio, canonical_name
-                    )
+                    # Calculate weight based on model quality and stem relevance
+                    base_weight = model_config.weight
 
-                    final_weight = model_weight * quality_weight
+                    # Boost weight if this stem is in the model's optimal list
+                    if canonical_name in model_config.optimal_for:
+                        weight = base_weight * 1.2
+                    else:
+                        weight = base_weight
 
-                    stem_tensors.append(stem_tensor)
-                    weights.append(final_weight)
+                    stem_data.append((stem_tensor, weight))
                     break
 
-        if not stem_tensors:
-            # Return silence if no stems found
-            return torch.zeros_like(original_audio)
+        return stem_data
 
-        # Normalize weights
+    def _weighted_average_blend(self, stem_data: List[Tuple[torch.Tensor, float]]) -> torch.Tensor:
+        """Blend stems using weighted average."""
+        if not stem_data:
+            return torch.zeros(2, 1)
+
+        stems, weights = zip(*stem_data)
         weights = torch.tensor(weights)
-        weights = weights / torch.sum(weights)
+        weights = weights / weights.sum()
 
-        # Weighted average in frequency domain for better quality
-        if self.use_frequency_weighting and len(stem_tensors) > 1:
-            return self._frequency_domain_blend(stem_tensors, weights)
+        # Ensure all stems have same shape
+        target_shape = stems[0].shape
+        aligned_stems = []
+
+        for stem in stems:
+            if stem.shape != target_shape:
+                # Align channels
+                if stem.shape[0] != target_shape[0]:
+                    if stem.shape[0] == 1 and target_shape[0] == 2:
+                        stem = stem.repeat(2, 1)
+                    elif stem.shape[0] == 2 and target_shape[0] == 1:
+                        stem = stem.mean(dim=0, keepdim=True)
+
+                # Align length
+                if stem.shape[-1] != target_shape[-1]:
+                    min_len = min(stem.shape[-1], target_shape[-1])
+                    stem = stem[..., :min_len]
+
+            aligned_stems.append(stem)
+
+        # Weighted sum
+        blended = torch.zeros_like(aligned_stems[0])
+        for stem, weight in zip(aligned_stems, weights):
+            blended += stem * weight
+
+        return blended
+
+    def _median_blend(self, stem_data: List[Tuple[torch.Tensor, float]]) -> torch.Tensor:
+        """Blend stems using median (robust to outliers)."""
+        if not stem_data:
+            return torch.zeros(2, 1)
+
+        stems, _ = zip(*stem_data)
+
+        # Stack and take median
+        stacked = torch.stack([s for s in stems if s.shape == stems[0].shape])
+        if len(stacked) > 0:
+            return torch.median(stacked, dim=0)[0]
         else:
-            # Simple weighted average
-            blended = torch.zeros_like(stem_tensors[0])
-            for stem, weight in zip(stem_tensors, weights):
-                blended += stem * weight
-            return blended
+            return stems[0]
 
-    def _calculate_stem_quality_weight(self, stem: torch.Tensor,
-                                       original: torch.Tensor, stem_type: str) -> float:
-        """Calculate quality-based weight for a stem."""
-        try:
-            # Energy-based quality assessment
-            stem_energy = torch.mean(stem ** 2)
+    def _frequency_weighted_blend(self, stem_data: List[Tuple[torch.Tensor, float]]) -> torch.Tensor:
+        """Blend stems with frequency-domain weighting."""
+        if not stem_data or not self.use_frequency_weighting:
+            return self._weighted_average_blend(stem_data)
 
-            # Frequency distribution quality (simplified)
-            if LIBROSA_AVAILABLE:
-                stem_np = stem.mean(dim=0).numpy() if stem.dim() > 1 else stem.numpy()
+        stems, weights = zip(*stem_data)
+        weights = torch.tensor(weights)
+        weights = weights / weights.sum()
 
-                # Spectral centroid as quality indicator
-                if len(stem_np) > 1024:  # Minimum length for analysis
-                    spectral_centroid = librosa.feature.spectral_centroid(y=stem_np, sr=44100)
-                    centroid_mean = np.mean(spectral_centroid)
-
-                    # Stem-specific quality adjustments
-                    if stem_type == "vocals" and 1000 <= centroid_mean <= 4000:
-                        return 1.2  # Boost good vocal range
-                    elif stem_type == "drums" and stem_energy > 0.01:
-                        return 1.1  # Boost energetic drums
-                    elif stem_type == "bass" and centroid_mean < 500:
-                        return 1.1  # Boost low-frequency bass
-
-            # Energy threshold
-            if stem_energy > 0.001:
-                return 1.0
-            else:
-                return 0.5  # Reduce weight for very quiet stems
-
-        except Exception:
-            return 1.0
-
-    def _frequency_domain_blend(self, stems: List[torch.Tensor], weights: torch.Tensor) -> torch.Tensor:
-        """Blend stems in frequency domain for better quality."""
         # Convert to frequency domain
         stfts = []
         for stem in stems:
             if stem.dim() > 1:
-                # Average channels for processing
-                mono_stem = torch.mean(stem, dim=0)
+                mono_stem = stem.mean(dim=0)
             else:
                 mono_stem = stem
 
-            stft = torch.stft(mono_stem, n_fft=2048, hop_length=512,
-                              win_length=2048, return_complex=True)
+            stft = torch.stft(
+                mono_stem,
+                n_fft=2048,
+                hop_length=512,
+                win_length=2048,
+                return_complex=True,
+                window=torch.hann_window(2048)
+            )
             stfts.append(stft)
 
         # Weighted blend in frequency domain
@@ -434,96 +623,111 @@ class EnsembleSourceSeparator:
             blended_stft += stft * weight
 
         # Convert back to time domain
-        blended_mono = torch.istft(blended_stft, n_fft=2048, hop_length=512,
-                                   win_length=2048, length=stems[0].shape[-1])
+        blended_mono = torch.istft(
+            blended_stft,
+            n_fft=2048,
+            hop_length=512,
+            win_length=2048,
+            window=torch.hann_window(2048),
+            length=stems[0].shape[-1]
+        )
 
-        # Restore original channel structure
-        if stems[0].dim() > 1:
-            blended = blended_mono.unsqueeze(0).repeat(stems[0].shape[0], 1)
+        # Restore stereo if needed
+        if stems[0].dim() > 1 and stems[0].shape[0] == 2:
+            blended = blended_mono.unsqueeze(0).repeat(2, 1)
         else:
             blended = blended_mono
 
         return blended
 
-    def _postprocess_stems(self, stems: Dict, sample_rate: int) -> Dict:
-        """Post-process stems for optimal quality."""
-        processed_stems = {}
-
-        for stem_name, stem_audio in stems.items():
-            # Gentle limiting to prevent clipping
-            max_val = torch.max(torch.abs(stem_audio))
-            if max_val > 0.99:
-                stem_audio = stem_audio * (0.99 / max_val)
-
-            # DC offset removal
-            stem_audio = stem_audio - torch.mean(stem_audio)
-
-            processed_stems[stem_name] = stem_audio
-
-        return processed_stems
-
-    def _calculate_advanced_metrics(self, original: torch.Tensor, stems: Dict) -> Dict:
-        """Calculate comprehensive separation quality metrics."""
+    def _calculate_metrics(self, original: torch.Tensor, stems: Dict) -> Dict:
+        """Calculate separation quality metrics."""
         metrics = {}
 
         # Reconstruct from stems
         reconstructed = torch.zeros_like(original)
         for stem in stems.values():
-            if stem.shape != original.shape:
-                # Handle shape mismatch
-                if stem.shape[0] != original.shape[0]:
-                    if stem.shape[0] == 1 and original.shape[0] == 2:
-                        stem = stem.repeat(2, 1)
-                    elif stem.shape[0] == 2 and original.shape[0] == 1:
-                        stem = torch.mean(stem, dim=0, keepdim=True)
-
-                # Handle length mismatch
-                if stem.shape[-1] != original.shape[-1]:
-                    min_len = min(stem.shape[-1], original.shape[-1])
-                    stem = stem[..., :min_len]
-
-            reconstructed += stem
+            if stem.shape == original.shape:
+                reconstructed += stem
 
         # SNR calculation
         signal_power = torch.mean(original ** 2)
-        noise_power = torch.mean((original - reconstructed) ** 2)
-        snr = 10 * torch.log10(signal_power / (noise_power + 1e-10))
+        noise = original - reconstructed
+        noise_power = torch.mean(noise ** 2)
 
-        metrics["reconstruction_snr"] = float(snr)
-        metrics["num_stems"] = len(stems)
+        if signal_power > 0:
+            snr = 10 * torch.log10(signal_power / (noise_power + 1e-10))
+            metrics["reconstruction_snr"] = float(snr)
+        else:
+            metrics["reconstruction_snr"] = 0.0
 
-        # Per-stem energy analysis
-        total_energy = torch.mean(original ** 2)
+        # SDR (Signal to Distortion Ratio) - more accurate than SNR
+        if signal_power > 0:
+            sdr = 10 * torch.log10(torch.sum(original ** 2) / (torch.sum(noise ** 2) + 1e-10))
+            metrics["sdr"] = float(sdr)
+
+        # Per-stem metrics
+        total_energy = torch.sum(original ** 2)
         for name, stem in stems.items():
-            stem_energy = torch.mean(stem ** 2)
+            stem_energy = torch.sum(stem ** 2)
             metrics[f"{name}_energy"] = float(stem_energy)
             metrics[f"{name}_energy_ratio"] = float(stem_energy / (total_energy + 1e-10))
 
         # Quality assessment
-        metrics["quality_grade"] = self._assess_quality_grade(snr, stems)
-        metrics["target_achieved"] = float(snr) >= self.target_snr
+        metrics["num_stems"] = len(stems)
+        metrics["quality_grade"] = self._assess_quality(metrics["reconstruction_snr"])
+        metrics["target_achieved"] = metrics["reconstruction_snr"] >= self.target_snr
 
         return metrics
 
-    def _assess_quality_grade(self, snr: torch.Tensor, stems: Dict) -> str:
-        """Assess overall separation quality grade."""
-        snr_val = float(snr)
-
-        if snr_val >= 0.30:
+    def _assess_quality(self, snr: float) -> str:
+        """Assess separation quality based on SNR."""
+        if snr >= 0.30:
             return "Excellent"
-        elif snr_val >= 0.20:
+        elif snr >= 0.20:
             return "Good"
-        elif snr_val >= 0.10:
+        elif snr >= 0.10:
             return "Fair"
         else:
             return "Poor"
 
+    def _postprocess_stems(self, stems: Dict, original_sr: int, target_sr: int) -> Dict:
+        """Post-process stems for final output."""
+        processed_stems = {}
+
+        for name, stem in stems.items():
+            # Resample to target sample rate if needed
+            if original_sr != target_sr and target_sr != 44100:
+                resampler = torchaudio.transforms.Resample(44100, target_sr)
+                stem = resampler(stem)
+
+            # Normalize to prevent clipping
+            max_val = torch.max(torch.abs(stem))
+            if max_val > 0.99:
+                stem = stem * (0.99 / max_val)
+
+            # Remove DC offset
+            stem = stem - torch.mean(stem, dim=-1, keepdim=True)
+
+            processed_stems[name] = stem
+
+        return processed_stems
+
     def get_model_info(self) -> Dict:
         """Get information about loaded models."""
-        return {
+        info = {
             "loaded_models": list(self.models.keys()),
-            "model_weights": self.model_weights,
+            "model_configs": {
+                name: {
+                    "weight": config.weight,
+                    "stems": config.stems,
+                    "quality_score": config.quality_score
+                }
+                for name, config in self.model_configs.items()
+            },
             "device": self.device,
             "quality_mode": self.quality_mode,
-            "target_snr": self.target_snr
+            "target_snr": self.target_snr,
+            "blend_method": self.blend_method
         }
+        return info

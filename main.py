@@ -2,7 +2,7 @@
 """
 High-Quality Audio Source Separation Pipeline
 ============================================
-Ensemble approach using multiple models for optimal separation quality.
+Production-ready ensemble approach for optimal separation quality.
 Target: SNR > 0.20
 """
 
@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Import our ensemble separator
+# Import our modules
 from modules.ensemble_separator import EnsembleSourceSeparator
 from modules.audio_loader import AudioLoader
 
@@ -42,84 +42,121 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class HighQualityAudioPipeline:
-    """High-quality audio source separation pipeline focused on SNR > 0.20."""
+class AudioSeparationPipeline:
+    """Production audio source separation pipeline."""
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """Initialize the high-quality separation pipeline."""
+        """Initialize the separation pipeline."""
         self.config = config or self._default_config()
         self.console = console
         self._initialize_components()
 
     def _default_config(self) -> Dict[str, Any]:
-        """Return configuration optimized for quality."""
+        """Return optimized configuration."""
+        device = "auto"
+        if device == "auto":
+            if torch.backends.mps.is_available():
+                device = "mps"
+            elif torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
+
         return {
-            "device": "mps" if torch.backends.mps.is_available() else "cpu",
+            "device": device,
             "sample_rate": 44100,
             "output_dir": Path("output"),
             "temp_dir": Path("temp"),
 
-            # Quality-focused settings
+            # Quality settings
             "quality_mode": "highest",
             "target_snr": 0.20,
-            "timeout": 1800,  # 30 minutes for quality processing
+            "timeout": 1800,
 
             # Ensemble configuration
-            "ensemble_models": [
-                "htdemucs_6s",  # Primary high-quality model
-                "htdemucs_ft",  # Fine-tuned backup
-                "mdx_extra_q",  # MDX high quality (if available)
-            ],
+            "ensemble_models": None,  # Will use defaults based on quality_mode
             "blend_method": "weighted_average",
             "use_frequency_weighting": True,
 
-            # Advanced options
-            "parallel_processing": True,
-            "save_individual_results": False,  # Only save final ensemble result
-            "detailed_metrics": True
+            # Performance
+            "max_parallel_models": 2,
+            "enable_cache": True,
+
+            # Output
+            "output_format": "wav",
+            "output_bitdepth": 24,
+            "save_metrics": True
         }
 
     def _initialize_components(self):
         """Initialize pipeline components."""
-        self.console.print(Panel.fit(
-            "[bold cyan]High-Quality Ensemble Source Separation[/bold cyan]\n"
-            f"Target SNR: ≥ {self.config['target_snr']}\n"
-            f"Quality Mode: {self.config['quality_mode']}\n"
-            f"Device: {self.config['device']}",
-            title="🎵 Quality-Focused Pipeline",
-            border_style="cyan"
-        ))
-
         # Create directories
-        for dir_path in [self.config["output_dir"], self.config["temp_dir"]]:
-            Path(dir_path).mkdir(parents=True, exist_ok=True)
+        self.config["output_dir"].mkdir(parents=True, exist_ok=True)
+        self.config["temp_dir"].mkdir(parents=True, exist_ok=True)
+
+        # Clean temp directory
+        self._clean_temp_dir()
 
         # Initialize components
         self.audio_loader = AudioLoader(self.config)
 
         try:
             self.separator = EnsembleSourceSeparator(self.config)
-            model_info = self.separator.get_model_info()
-
-            self.console.print(f"[green]✓ Loaded {len(model_info['loaded_models'])} models:[/green]")
-            for model in model_info['loaded_models']:
-                weight = model_info['model_weights'].get(model, 1.0)
-                self.console.print(f"  • {model} (weight: {weight})")
-
+            self._print_initialization_info()
         except Exception as e:
             self.console.print(f"[red]Failed to initialize separator: {e}[/red]")
             raise
 
-    def separate_audio(self, input_path: Path, output_name: Optional[str] = None) -> Dict[str, Any]:
+    def _clean_temp_dir(self):
+        """Clean temporary directory."""
+        temp_dir = self.config["temp_dir"]
+        if temp_dir.exists():
+            for file in temp_dir.glob("*"):
+                try:
+                    if file.is_file():
+                        file.unlink()
+                except Exception:
+                    pass
+
+    def _print_initialization_info(self):
+        """Print initialization information."""
+        model_info = self.separator.get_model_info()
+
+        self.console.print(Panel.fit(
+            f"[bold cyan]Audio Source Separation Pipeline[/bold cyan]\n"
+            f"Device: {model_info['device']}\n"
+            f"Quality Mode: {model_info['quality_mode']}\n"
+            f"Target SNR: ≥ {model_info['target_snr']:.2f} dB\n"
+            f"Models: {len(model_info['loaded_models'])}",
+            title="🎵 Pipeline Ready",
+            border_style="cyan"
+        ))
+
+        # Print loaded models
+        self.console.print("\n[bold]Loaded Models:[/bold]")
+        for model_name in model_info['loaded_models']:
+            config = model_info['model_configs'][model_name]
+            self.console.print(
+                f"  • {model_name}: "
+                f"weight={config['weight']:.2f}, "
+                f"stems={config['stems']}, "
+                f"quality={config['quality_score']:.2f}"
+            )
+
+    def separate_audio(self,
+                       input_path: Path,
+                       output_name: Optional[str] = None,
+                       save_individual_stems: bool = True) -> Dict[str, Any]:
         """
-        Perform high-quality source separation.
+        Perform source separation on audio file.
 
         Args:
             input_path: Path to input audio file
-            output_name: Optional custom output name
+            output_name: Optional output name (defaults to input filename)
+            save_individual_stems: Whether to save individual stem files
 
         Returns:
-            Processing results with quality metrics
+            Processing results dictionary
         """
         start_time = time.time()
 
@@ -131,9 +168,9 @@ class HighQualityAudioPipeline:
             "output_name": output_name,
             "timestamp": datetime.now().isoformat(),
             "config": {
-                "target_snr": self.config["target_snr"],
                 "quality_mode": self.config["quality_mode"],
-                "ensemble_models": self.config["ensemble_models"]
+                "target_snr": self.config["target_snr"],
+                "device": str(self.config["device"])
             }
         }
 
@@ -142,12 +179,19 @@ class HighQualityAudioPipeline:
             self._print_stage("Loading Audio", "📂")
             audio_data = self.audio_loader.load(input_path)
 
-            self.console.print(f"[yellow]Duration: {audio_data['duration']:.1f}s, "
-                               f"Channels: {audio_data['channels']}, "
-                               f"Sample Rate: {audio_data['sample_rate']}Hz[/yellow]")
+            self.console.print(
+                f"Duration: {audio_data['duration']:.1f}s | "
+                f"Channels: {audio_data['channels']} | "
+                f"Sample Rate: {audio_data['sample_rate']}Hz | "
+                f"Format: {audio_data['format'].upper()}"
+            )
 
-            # Perform ensemble separation with progress tracking
-            self._print_stage("Ensemble Source Separation", "🎛️")
+            # Check duration
+            if audio_data['duration'] > 600:  # 10 minutes
+                self.console.print("[yellow]⚠ Long audio file. Processing may take several minutes.[/yellow]")
+
+            # Perform separation
+            self._print_stage("Running Ensemble Separation", "🎛️")
 
             with Progress(
                     SpinnerColumn(),
@@ -155,10 +199,11 @@ class HighQualityAudioPipeline:
                     BarColumn(),
                     TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
                     TimeElapsedColumn(),
-                    console=self.console
+                    console=self.console,
+                    transient=False
             ) as progress:
 
-                task = progress.add_task("Processing...", total=100)
+                task = progress.add_task("Initializing...", total=100)
 
                 def progress_callback(percent: float, message: str):
                     progress.update(task, completed=percent * 100, description=message)
@@ -169,34 +214,40 @@ class HighQualityAudioPipeline:
                     progress_callback=progress_callback
                 )
 
-            # Save separated stems
-            self._print_stage("Saving Results", "💾")
-            stem_paths = self._save_stems(separated, audio_data, output_name)
+            # Save stems
+            if save_individual_stems:
+                self._print_stage("Saving Separated Stems", "💾")
+                stem_paths = self._save_stems(separated, audio_data, output_name)
+                results["stems"] = stem_paths
 
-            # Compile results
+            # Update results
             results.update({
-                "stems": stem_paths,
                 "metrics": separated["metrics"],
                 "ensemble_info": separated["ensemble_info"],
                 "processing_time": separated["processing_time"],
                 "total_time": time.time() - start_time
             })
 
-            # Save processing results
-            self._save_processing_results(results)
+            # Save metrics if enabled
+            if self.config["save_metrics"]:
+                self._save_metrics(results, output_name)
 
-            # Display quality assessment
-            self._display_quality_results(results)
+            # Display results
+            self._display_results(results)
 
             return results
 
+        except KeyboardInterrupt:
+            self.console.print("\n[yellow]Processing interrupted by user[/yellow]")
+            raise
         except Exception as e:
             logger.error(f"Separation failed: {str(e)}")
             results["error"] = str(e)
+            results["total_time"] = time.time() - start_time
             raise
 
     def _print_stage(self, stage: str, emoji: str):
-        """Print a processing stage header."""
+        """Print processing stage."""
         self.console.print(f"\n{emoji} [bold cyan]{stage}[/bold cyan]")
 
     def _save_stems(self, separated: Dict, audio_data: Dict, output_name: str) -> Dict[str, str]:
@@ -206,257 +257,327 @@ class HighQualityAudioPipeline:
 
         stem_paths = {}
 
+        # Save each stem
         for stem_name, stem_audio in separated["stems"].items():
-            stem_path = output_dir / f"{stem_name}.wav"
+            stem_path = output_dir / f"{stem_name}.{self.config['output_format']}"
 
-            # Ensure proper format for saving
+            # Ensure proper shape
             if stem_audio.dim() == 1:
                 stem_audio = stem_audio.unsqueeze(0)
 
-            torchaudio.save(
-                stem_path,
-                stem_audio,
-                audio_data["sample_rate"],
-                bits_per_sample=24  # High quality output
-            )
+            # Save with high quality
+            if self.config["output_format"] == "wav":
+                torchaudio.save(
+                    stem_path,
+                    stem_audio,
+                    audio_data["sample_rate"],
+                    bits_per_sample=self.config["output_bitdepth"]
+                )
+            else:
+                torchaudio.save(stem_path, stem_audio, audio_data["sample_rate"])
 
             stem_paths[stem_name] = str(stem_path)
 
-            # Calculate and display stem info
+            # Display info
             duration = stem_audio.shape[-1] / audio_data["sample_rate"]
             size_mb = stem_path.stat().st_size / (1024 * 1024)
-
             self.console.print(f"  ✓ {stem_name}: {duration:.1f}s, {size_mb:.1f}MB")
 
         return stem_paths
 
-    def _save_processing_results(self, results: Dict):
-        """Save detailed processing results."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_file = self.config["output_dir"] / f"separation_results_{timestamp}.json"
+    def _save_metrics(self, results: Dict, output_name: str):
+        """Save processing metrics."""
+        metrics_dir = self.config["output_dir"] / "metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
 
-        # Prepare results for JSON serialization
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        metrics_file = metrics_dir / f"{output_name}_{timestamp}.json"
+
+        # Prepare for JSON serialization
         json_results = json.loads(json.dumps(results, default=str))
 
-        with open(results_file, 'w') as f:
+        with open(metrics_file, 'w') as f:
             json.dump(json_results, f, indent=2)
 
-        self.console.print(f"[dim]Results saved to {results_file}[/dim]")
+        self.console.print(f"[dim]Metrics saved to {metrics_file}[/dim]")
 
-    def _display_quality_results(self, results: Dict):
-        """Display comprehensive quality assessment."""
+    def _display_results(self, results: Dict):
+        """Display separation results."""
         metrics = results["metrics"]
 
-        # Main quality table
-        table = Table(title="Separation Quality Assessment", show_header=True)
-        table.add_column("Metric", style="cyan", width=20)
-        table.add_column("Value", style="yellow", width=15)
-        table.add_column("Status", style="white", width=15)
+        # Quality metrics table
+        table = Table(title="Separation Quality Metrics", show_header=True)
+        table.add_column("Metric", style="cyan", width=25)
+        table.add_column("Value", style="yellow", width=20)
+        table.add_column("Status", style="white", width=20)
 
-        # SNR assessment
+        # SNR
         snr = metrics.get("reconstruction_snr", 0)
-        snr_status = "✓ Excellent" if snr >= 0.30 else "✓ Good" if snr >= 0.20 else "⚠ Fair" if snr >= 0.10 else "✗ Poor"
         snr_color = "green" if snr >= 0.20 else "yellow" if snr >= 0.10 else "red"
-
+        snr_status = "✓ Target Met" if snr >= self.config["target_snr"] else "✗ Below Target"
         table.add_row("SNR", f"{snr:.3f} dB", f"[{snr_color}]{snr_status}[/{snr_color}]")
-        table.add_row("Quality Grade", metrics.get("quality_grade", "Unknown"),
-                      "✓ Target Met" if metrics.get("target_achieved", False) else "✗ Target Missed")
+
+        # SDR if available
+        if "sdr" in metrics:
+            sdr = metrics["sdr"]
+            table.add_row("SDR", f"{sdr:.3f} dB", "")
+
+        # Quality grade
+        table.add_row("Quality Grade", metrics.get("quality_grade", "Unknown"), "")
+
+        # Processing info
         table.add_row("Stems Generated", str(metrics.get("num_stems", 0)), "")
         table.add_row("Processing Time", f"{results['processing_time']:.1f}s", "")
+        table.add_row("Total Time", f"{results['total_time']:.1f}s", "")
 
         self.console.print("\n")
         self.console.print(table)
 
         # Stem energy distribution
-        stem_table = Table(title="Stem Energy Distribution", show_header=True)
-        stem_table.add_column("Stem", style="cyan")
-        stem_table.add_column("Energy Ratio", style="yellow")
-        stem_table.add_column("Quality", style="green")
+        if any(k.endswith("_energy_ratio") for k in metrics.keys()):
+            stem_table = Table(title="Stem Energy Distribution", show_header=True)
+            stem_table.add_column("Stem", style="cyan")
+            stem_table.add_column("Energy Ratio", style="yellow")
+            stem_table.add_column("Level", style="green")
 
-        for stem_name in results["stems"].keys():
-            energy_ratio = metrics.get(f"{stem_name}_energy_ratio", 0)
-            energy_percent = energy_ratio * 100
+            for key in sorted(metrics.keys()):
+                if key.endswith("_energy_ratio"):
+                    stem_name = key.replace("_energy_ratio", "")
+                    ratio = metrics[key]
+                    percent = ratio * 100
 
-            # Simple quality assessment based on energy
-            if energy_percent > 15:
-                quality = "High"
-            elif energy_percent > 5:
-                quality = "Medium"
-            else:
-                quality = "Low"
+                    if percent > 20:
+                        level = "High"
+                    elif percent > 5:
+                        level = "Medium"
+                    else:
+                        level = "Low"
 
-            stem_table.add_row(stem_name.capitalize(), f"{energy_percent:.1f}%", quality)
+                    stem_table.add_row(stem_name.capitalize(), f"{percent:.1f}%", level)
 
-        self.console.print(stem_table)
+            self.console.print(stem_table)
 
-        # Ensemble information
-        ensemble_info = results.get("ensemble_info", {})
-        if ensemble_info:
-            self.console.print(f"\n[bold]Ensemble Details:[/bold]")
-            self.console.print(f"Models Used: {', '.join(ensemble_info.get('models_used', []))}")
-            self.console.print(f"Blend Method: {ensemble_info.get('blend_method', 'Unknown')}")
-            self.console.print(f"Quality Mode: {ensemble_info.get('quality_mode', 'Unknown')}")
+    def batch_process(self, input_files: list[Path], output_dir: Optional[Path] = None) -> list[Dict]:
+        """
+        Process multiple audio files.
+
+        Args:
+            input_files: List of input file paths
+            output_dir: Optional output directory
+
+        Returns:
+            List of results for each file
+        """
+        if output_dir:
+            self.config["output_dir"] = output_dir
+
+        results = []
+        total_files = len(input_files)
+
+        self.console.print(f"\n[bold]Batch Processing {total_files} files[/bold]\n")
+
+        for i, input_file in enumerate(input_files, 1):
+            self.console.print(f"\n[bold magenta]File {i}/{total_files}: {input_file.name}[/bold magenta]")
+            self.console.print("=" * 60)
+
+            try:
+                result = self.separate_audio(input_file)
+                results.append(result)
+                self.console.print(f"[green]✓ Completed {input_file.name}[/green]")
+            except Exception as e:
+                self.console.print(f"[red]✗ Failed {input_file.name}: {e}[/red]")
+                results.append({"input": str(input_file), "error": str(e)})
+
+        # Summary
+        successful = sum(1 for r in results if "error" not in r)
+        self.console.print(f"\n[bold]Batch Complete: {successful}/{total_files} successful[/bold]")
+
+        return results
 
 
-def validate_input_file(file_path: Path) -> bool:
-    """Validate input audio file."""
+def validate_input(file_path: Path) -> bool:
+    """Validate input file."""
     if not file_path.exists():
         console.print(f"[red]Error: File not found: {file_path}[/red]")
         return False
 
-    # Check file extension
-    valid_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.aac', '.ogg'}
+    valid_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wma'}
     if file_path.suffix.lower() not in valid_extensions:
-        console.print(f"[red]Error: Unsupported file format: {file_path.suffix}[/red]")
-        console.print(f"Supported formats: {', '.join(valid_extensions)}")
+        console.print(f"[red]Error: Unsupported format: {file_path.suffix}[/red]")
+        console.print(f"Supported: {', '.join(sorted(valid_extensions))}")
         return False
 
-    # Check file size (warn if very large)
+    # Check file size
     size_mb = file_path.stat().st_size / (1024 * 1024)
-    if size_mb > 500:  # 500MB warning
-        console.print(f"[yellow]Warning: Large file ({size_mb:.1f}MB). Processing may take a long time.[/yellow]")
+    if size_mb > 1000:  # 1GB warning
+        response = console.input(f"[yellow]Large file ({size_mb:.1f}MB). Continue? (y/n): [/yellow]")
+        if response.lower() != 'y':
+            return False
 
     return True
 
 
-def check_system_requirements():
-    """Check system requirements for high-quality processing."""
-    console.print(Panel.fit(
-        "[bold cyan]System Requirements Check[/bold cyan]",
-        title="🔧 System Check"
-    ))
+def check_requirements():
+    """Check system requirements."""
+    issues = []
 
     # Check PyTorch
     try:
         import torch
-        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-        console.print(f"[green]✓ PyTorch available[/green] (Device: {device})")
+        device_info = "CPU"
+        if torch.backends.mps.is_available():
+            device_info = "Apple Silicon (MPS)"
+        elif torch.cuda.is_available():
+            device_info = f"CUDA GPU ({torch.cuda.get_device_name(0)})"
+        console.print(f"[green]✓ PyTorch available[/green] - Device: {device_info}")
     except ImportError:
-        console.print("[red]✗ PyTorch not available[/red]")
-        return False
+        issues.append("PyTorch not installed (pip install torch)")
 
     # Check Demucs
     try:
-        from demucs import pretrained
+        import demucs
         console.print("[green]✓ Demucs available[/green]")
     except ImportError:
-        console.print("[red]✗ Demucs not available[/red]")
-        console.print("Install with: pip install demucs")
-        return False
+        issues.append("Demucs not installed (pip install demucs)")
 
     # Check memory
     try:
         import psutil
         memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-        if memory_gb >= 16:
-            console.print(f"[green]✓ Memory: {memory_gb:.1f}GB[/green]")
-        else:
-            console.print(f"[yellow]⚠ Memory: {memory_gb:.1f}GB (16GB+ recommended)[/yellow]")
+        available_gb = psutil.virtual_memory().available / (1024 ** 3)
+        status = "green" if memory_gb >= 16 else "yellow"
+        console.print(f"[{status}]✓ Memory: {memory_gb:.1f}GB total, {available_gb:.1f}GB available[/{status}]")
+        if memory_gb < 8:
+            issues.append("Low memory (8GB minimum, 16GB recommended)")
     except ImportError:
         console.print("[dim]Memory check skipped (psutil not installed)[/dim]")
 
-    return True
+    return len(issues) == 0, issues
 
 
 def main():
-    """Main entry point for high-quality audio separation."""
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="High-Quality Audio Source Separation (Target SNR > 0.20)",
+        description="High-Quality Audio Source Separation Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py song.wav                    # Separate with default settings
-  python main.py song.mp3 --output my_song  # Custom output name
-  python main.py song.wav --models htdemucs_6s htdemucs_ft  # Specific models
-  python main.py --check                    # Check system requirements
+  %(prog)s song.mp3                     # Separate with default settings
+  %(prog)s song.wav -o my_song          # Custom output name
+  %(prog)s song.mp3 -q high             # High quality mode
+  %(prog)s *.mp3 --batch                # Process multiple files
+  %(prog)s --check                      # Check system requirements
         """
     )
 
-    parser.add_argument("input", nargs="?", type=Path, help="Input audio file")
-    parser.add_argument("--output", "-o", help="Output name (default: input filename)")
-    parser.add_argument("--models", nargs="+",
-                        choices=["htdemucs_6s", "htdemucs_ft", "htdemucs", "mdx_extra_q", "mdx23c_musdb18"],
-                        help="Specific models to use in ensemble")
-    parser.add_argument("--target-snr", type=float, default=0.20,
+    parser.add_argument("input", nargs="*", type=Path, help="Input audio file(s)")
+    parser.add_argument("-o", "--output", help="Output name")
+    parser.add_argument("-q", "--quality",
+                        choices=["highest", "high", "balanced", "fast"],
+                        default="highest", help="Quality mode (default: highest)")
+    parser.add_argument("--snr-target", type=float, default=0.20,
                         help="Target SNR threshold (default: 0.20)")
-    parser.add_argument("--timeout", type=int, default=1800,
-                        help="Processing timeout in seconds (default: 1800)")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"],
                         default="auto", help="Processing device")
+    parser.add_argument("--models", nargs="+",
+                        help="Specific models to use")
+    parser.add_argument("--blend", choices=["weighted_average", "median", "frequency_weighted"],
+                        default="weighted_average", help="Blending method")
+    parser.add_argument("--batch", action="store_true",
+                        help="Process multiple files")
+    parser.add_argument("--no-stems", action="store_true",
+                        help="Don't save individual stem files")
     parser.add_argument("--check", action="store_true",
-                        help="Check system requirements and exit")
-    parser.add_argument("--quality", choices=["highest", "high", "balanced"],
-                        default="highest", help="Quality mode")
+                        help="Check system requirements")
 
     args = parser.parse_args()
 
-    # System requirements check
+    # Check requirements
     if args.check:
-        success = check_system_requirements()
+        console.print(Panel.fit("[bold]System Requirements Check[/bold]", border_style="cyan"))
+        success, issues = check_requirements()
+        if not success:
+            console.print("\n[red]Issues found:[/red]")
+            for issue in issues:
+                console.print(f"  • {issue}")
         sys.exit(0 if success else 1)
 
+    # Validate input
     if not args.input:
         parser.print_help()
-        return
-
-    # Validate input
-    if not validate_input_file(args.input):
         sys.exit(1)
 
-    # Check system requirements
-    if not check_system_requirements():
-        console.print("[red]System requirements not met![/red]")
-        sys.exit(1)
+    # Batch processing
+    if args.batch or len(args.input) > 1:
+        valid_files = [f for f in args.input if validate_input(f)]
+        if not valid_files:
+            console.print("[red]No valid input files[/red]")
+            sys.exit(1)
+    else:
+        if not validate_input(args.input[0]):
+            sys.exit(1)
+        valid_files = [args.input[0]]
 
-    # Print banner
-    console.print(Panel.fit(
-        f"[bold magenta]High-Quality Audio Source Separation[/bold magenta]\n"
-        f"📂 Input: {args.input}\n"
-        f"🎯 Target SNR: ≥ {args.target_snr}\n"
-        f"⚙️ Quality: {args.quality}\n"
-        f"🔧 Device: {args.device}",
-        title="🎵 Ensemble Separation",
-        border_style="magenta"
-    ))
+    # Check requirements
+    success, issues = check_requirements()
+    if not success:
+        console.print("[red]System requirements not met:[/red]")
+        for issue in issues:
+            console.print(f"  • {issue}")
+        response = console.input("[yellow]Continue anyway? (y/n): [/yellow]")
+        if response.lower() != 'y':
+            sys.exit(1)
 
     # Configure pipeline
     config = {
-        "device": args.device if args.device != "auto" else ("mps" if torch.backends.mps.is_available() else "cpu"),
-        "output_dir": Path("output"),
-        "temp_dir": Path("temp"),
         "quality_mode": args.quality,
-        "target_snr": args.target_snr,
-        "timeout": args.timeout,
-        "detailed_metrics": True
+        "target_snr": args.snr_target,
+        "device": args.device,
+        "blend_method": args.blend
     }
 
     if args.models:
         config["ensemble_models"] = args.models
 
+    # Print header
+    console.print(Panel.fit(
+        f"[bold magenta]Audio Source Separation[/bold magenta]\n"
+        f"Files: {len(valid_files)}\n"
+        f"Quality: {args.quality}\n"
+        f"Target SNR: ≥ {args.snr_target:.2f} dB",
+        title="🎵 Processing Started",
+        border_style="magenta"
+    ))
+
     # Run pipeline
     try:
-        pipeline = HighQualityAudioPipeline(config)
-        results = pipeline.separate_audio(args.input, args.output)
+        pipeline = AudioSeparationPipeline(config)
+
+        if len(valid_files) > 1:
+            results = pipeline.batch_process(valid_files)
+        else:
+            results = [pipeline.separate_audio(
+                valid_files[0],
+                args.output,
+                save_individual_stems=not args.no_stems
+            )]
 
         # Final summary
-        snr = results["metrics"]["reconstruction_snr"]
-        target_met = snr >= args.target_snr
+        successful = sum(1 for r in results if "error" not in r)
+        console.print(f"\n[bold green]✨ Processing Complete![/bold green]")
+        console.print(f"Successful: {successful}/{len(results)}")
 
-        console.print(f"\n[bold green]✨ Separation Complete![/bold green]")
-        console.print(f"SNR: {snr:.3f} dB {'✓' if target_met else '✗'}")
-        console.print(f"Total Time: {results['total_time']:.1f}s")
-        console.print(f"Output Directory: output/separated/{args.output or args.input.stem}/")
-
-        if target_met:
-            console.print("[bold green]🎉 Target SNR achieved![/bold green]")
-        else:
-            console.print(f"[yellow]⚠ Target SNR ({args.target_snr}) not reached[/yellow]")
+        if successful > 0:
+            avg_snr = sum(r["metrics"]["reconstruction_snr"] for r in results if "error" not in r) / successful
+            console.print(f"Average SNR: {avg_snr:.3f} dB")
+            console.print(f"Output: {config.get('output_dir', Path('output'))}/separated/")
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Processing interrupted by user[/yellow]")
+        console.print("\n[yellow]Processing cancelled[/yellow]")
         sys.exit(1)
     except Exception as e:
-        console.print(f"\n[red]Error: {e}[/red]")
+        console.print(f"\n[red]Fatal error: {e}[/red]")
+        logger.exception("Fatal error")
         sys.exit(1)
 
 
