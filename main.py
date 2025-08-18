@@ -561,7 +561,7 @@ def main():
     parser.add_argument("--separator", default="demucs",
                         choices=["demucs"],
                         help="Source separator model")
-    parser.add_argument("--demucs-model", default="htdemucs_ft",
+    parser.add_argument("--demucs-model", default="htdemucs_6s",
                         choices=["htdemucs", "htdemucs_ft", "htdemucs_6s"],
                         help="Demucs model variant")
     parser.add_argument("--audiocraft-model", default="musicgen-medium",
