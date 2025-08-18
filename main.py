@@ -22,7 +22,6 @@ from datetime import datetime
 import numpy as np
 import torch
 import torchaudio
-import matplotlib.pyplot as plt
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
@@ -40,11 +39,11 @@ from modules.demucs_separator import DemucsSeparator
 from modules.audiocraft_processor import AudioCraftProcessor
 from modules.ddsp_transfer import DDSPStyleTransfer
 from modules.audio_analyzer import AudioAnalyzer
-from modules.visualization import AudioVisualizer
 from modules.deepseek_assistant import DeepSeekAssistant
-from modules.educational_reporter import EducationalReporter
 import ssl
+
 ssl._create_default_https_context = ssl._create_unverified_context
+
 # Configure rich console for beautiful output
 console = Console()
 
@@ -86,16 +85,18 @@ class EducationalAudioPipeline:
             "educational_mode": False,
             "verbose": True,
             "save_intermediates": True,
-            "visualization": True,
+            "visualization": False,
             "analysis": True,
             "demucs": {
-                "model": "htdemucs_6s",  # Latest fine-tuned model
+                "model": "htdemucs_ft",  # Faster model by default
                 "split": True,
                 "two_stems": None,
                 "mp3": True,
                 "mp3_rate": 320,
                 "float32": False,
                 "int24": False,
+                "shifts": 6,  # Balanced quality/speed
+                "overlap": 0.25,  # Reduced for speed
             },
             "audiocraft": {
                 "model": "musicgen-medium",
@@ -112,7 +113,7 @@ class EducationalAudioPipeline:
                 "f0_octave_shift": 0,
             },
             "deepseek": {
-                "api_key": None,  # Set via environment variable
+                "api_key": None,
                 "model": "deepseek-chat",
                 "temperature": 0.7,
                 "max_tokens": 2048,
@@ -120,7 +121,7 @@ class EducationalAudioPipeline:
         }
 
     def _initialize_components(self):
-        """Initialize all pipeline components."""
+        """Initialize all pipeline components with progress tracking."""
         self.console.print(Panel.fit(
             "[bold cyan]Initializing Educational Audio Pipeline[/bold cyan]\n"
             "Loading AI models and preparing learning environment...",
@@ -133,40 +134,45 @@ class EducationalAudioPipeline:
                 console=self.console
         ) as progress:
             # Create directories
-            task = progress.add_task("Creating directories...", total=3)
-            for dir_path in [self.config["output_dir"],
-                             self.config["temp_dir"],
-                             self.config["models_dir"]]:
+            task1 = progress.add_task("Creating directories...", total=100)
+            for i, dir_path in enumerate([self.config["output_dir"],
+                                          self.config["temp_dir"],
+                                          self.config["models_dir"]]):
                 Path(dir_path).mkdir(parents=True, exist_ok=True)
-                progress.advance(task)
+                progress.update(task1, advance=33)
 
-            # Initialize components
-            progress.add_task("Loading audio utilities...")
+            # Initialize components with progress tracking
+            task2 = progress.add_task("Loading audio utilities...", total=100)
             self.audio_loader = AudioLoader(self.config)
+            progress.update(task2, advance=100)
 
-            progress.add_task("Initializing Demucs v4...")
+            task3 = progress.add_task("Initializing Demucs v4 (downloading if needed)...", total=100)
             self.separator = DemucsSeparator(self.config)
+            progress.update(task3, advance=100)
 
-            progress.add_task("Loading AudioCraft suite...")
-            self.audiocraft = AudioCraftProcessor(self.config)
+            task4 = progress.add_task("Loading AudioCraft suite (downloading if needed)...", total=100)
+            try:
+                self.audiocraft = AudioCraftProcessor(self.config)
+                progress.update(task4, advance=100)
+            except Exception as e:
+                logger.warning(f"AudioCraft loading failed: {e}")
+                self.audiocraft = None
+                progress.update(task4, advance=100)
 
-            progress.add_task("Setting up DDSP...")
+            task5 = progress.add_task("Setting up DDSP...", total=100)
             self.style_transfer = DDSPStyleTransfer(self.config)
+            progress.update(task5, advance=100)
 
-            progress.add_task("Preparing analyzer...")
+            task6 = progress.add_task("Preparing analyzer...", total=100)
             self.analyzer = AudioAnalyzer(self.config)
-
-            progress.add_task("Configuring visualizer...")
-            self.visualizer = AudioVisualizer(self.config)
+            progress.update(task6, advance=100)
 
             if self.config["deepseek"]["api_key"]:
-                progress.add_task("Connecting to DeepSeek...")
+                task7 = progress.add_task("Connecting to DeepSeek API...", total=100)
                 self.assistant = DeepSeekAssistant(self.config)
+                progress.update(task7, advance=100)
             else:
                 self.assistant = None
-
-            progress.add_task("Setting up reporter...")
-            self.reporter = EducationalReporter(self.config)
 
     def process_audio(self,
                       input_path: Path,
@@ -225,11 +231,6 @@ class EducationalAudioPipeline:
                 if interactive:
                     self._interactive_checkpoint("Style transferred", transferred)
 
-            # Stage 5: Generate educational report
-            if self.config["educational_mode"]:
-                self._print_stage("Educational Analysis", "📊")
-                self._generate_educational_report(results)
-
             # Calculate total processing time
             results["total_time"] = time.time() - start_time
 
@@ -264,17 +265,6 @@ class EducationalAudioPipeline:
 
         results["stages"]["analysis"] = analysis
 
-        # Generate visualizations if enabled
-        if self.config["visualization"]:
-            viz_path = self.config["output_dir"] / f"{input_path.stem}_input_viz.png"
-            self.visualizer.create_spectrogram(
-                audio_data["waveform"],
-                audio_data["sample_rate"],
-                viz_path,
-                title="Input Audio Spectrogram"
-            )
-            results["stages"]["loading"]["visualization"] = str(viz_path)
-
         # Add educational insight
         if self.assistant:
             insight = self.assistant.explain_audio_features(analysis)
@@ -286,41 +276,61 @@ class EducationalAudioPipeline:
         return audio_data
 
     def _separate_sources(self, audio_data: Dict, results: Dict, interactive: bool) -> Dict:
-        """Perform source separation using Demucs v4."""
-        # Run separation
-        separated = self.separator.separate(
-            audio_data["waveform"],
-            audio_data["sample_rate"],
-            progress_callback=self._progress_callback if interactive else None
+        """Perform source separation using Demucs v4 with progress tracking."""
+
+        # Progress tracking for separation
+        separation_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console
         )
+
+        with separation_progress:
+            task = separation_progress.add_task("Initializing separation...", total=100)
+
+            def progress_callback(progress: float, message: str):
+                separation_progress.update(task, completed=int(progress * 100), description=message)
+
+            # Run separation with progress callback
+            separated = self.separator.separate(
+                audio_data["waveform"],
+                audio_data["sample_rate"],
+                progress_callback=progress_callback
+            )
 
         # Save separated stems
         output_dir = self.config["output_dir"] / "separated"
         output_dir.mkdir(exist_ok=True)
 
-        stem_paths = {}
-        for stem_name, stem_audio in separated["stems"].items():
-            stem_path = output_dir / f"{audio_data['filename']}_{stem_name}.wav"
-            torchaudio.save(stem_path, stem_audio, audio_data["sample_rate"])
-            stem_paths[stem_name] = str(stem_path)
+        # Progress for saving stems
+        save_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console
+        )
 
-            # Visualize each stem
-            if self.config["visualization"]:
-                viz_path = output_dir / f"{audio_data['filename']}_{stem_name}_viz.png"
-                self.visualizer.create_spectrogram(
-                    stem_audio,
-                    audio_data["sample_rate"],
-                    viz_path,
-                    title=f"{stem_name.capitalize()} Stem Spectrogram"
-                )
+        with save_progress:
+            save_task = save_progress.add_task("Saving stems...", total=len(separated["stems"]))
 
-        # Store results
+            stem_paths = {}
+            for i, (stem_name, stem_audio) in enumerate(separated["stems"].items()):
+                stem_path = output_dir / f"{audio_data['filename']}_{stem_name}.wav"
+                torchaudio.save(stem_path, stem_audio, audio_data["sample_rate"])
+                stem_paths[stem_name] = str(stem_path)
+                save_progress.update(save_task, advance=1, description=f"Saved {stem_name}")
+
+        # Store results with detailed metrics
         results["stages"]["separation"] = {
             "model": self.config["demucs"]["model"],
             "stems": stem_paths,
             "metrics": separated.get("metrics", {}),
-            "processing_time": separated.get("processing_time", 0)
+            "processing_time": separated.get("processing_time", 0),
+            "snr_db": separated.get("metrics", {}).get("reconstruction_snr", 0),
+            "quality_score": self._calculate_quality_score(separated.get("metrics", {}))
         }
+
+        # Display separation quality metrics
+        self._display_separation_metrics(separated.get("metrics", {}))
 
         # Educational insight about separation
         if self.assistant:
@@ -335,13 +345,58 @@ class EducationalAudioPipeline:
 
         return separated
 
+    def _calculate_quality_score(self, metrics: Dict) -> float:
+        """Calculate overall quality score based on metrics."""
+        snr = metrics.get("reconstruction_snr", 0)
+        num_stems = metrics.get("num_stems", 0)
+
+        # Simple quality scoring based on SNR and stem count
+        base_score = min(snr / 30.0, 1.0)  # Normalize SNR (30dB = excellent)
+        stem_bonus = min(num_stems / 6.0, 1.0) * 0.1  # Bonus for more stems
+
+        return min(base_score + stem_bonus, 1.0) * 100
+
+    def _display_separation_metrics(self, metrics: Dict):
+        """Display detailed separation quality metrics."""
+        table = Table(title="Separation Quality Metrics", show_header=True)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_column("Quality", style="yellow")
+
+        snr = metrics.get("reconstruction_snr", 0)
+        num_stems = metrics.get("num_stems", 0)
+
+        # SNR Quality assessment
+        if snr >= 25:
+            snr_quality = "Excellent"
+        elif snr >= 20:
+            snr_quality = "Very Good"
+        elif snr >= 15:
+            snr_quality = "Good"
+        elif snr >= 10:
+            snr_quality = "Fair"
+        else:
+            snr_quality = "Poor"
+
+        table.add_row("SNR (dB)", f"{snr:.2f}", snr_quality)
+        table.add_row("Number of Stems", str(num_stems), "Standard" if num_stems >= 4 else "Limited")
+
+        # Energy distribution
+        for key, value in metrics.items():
+            if key.endswith("_energy") and isinstance(value, (int, float)):
+                stem_name = key.replace("_energy", "")
+                table.add_row(f"{stem_name.title()} Energy", f"{value:.4f}", "-")
+
+        self.console.print("\n")
+        self.console.print(table)
+
     def _process_audiocraft(self, audio_data: Dict, results: Dict, interactive: bool) -> Dict:
         """Process audio using AudioCraft suite."""
         # Apply AudioCraft processing
         processed = self.audiocraft.process(
             audio_data["waveform"],
             audio_data["sample_rate"],
-            mode="enhance"  # or "generate" based on config
+            mode="enhance"
         )
 
         # Save processed audio
@@ -403,31 +458,11 @@ class EducationalAudioPipeline:
 
         return transferred
 
-    def _generate_educational_report(self, results: Dict):
-        """Generate comprehensive educational report."""
-        report = self.reporter.generate_report(results)
-
-        # Save report
-        report_path = self.config["output_dir"] / "educational_report.html"
-        report_path.write_text(report["html"])
-
-        # Also save as JSON for programmatic access
-        json_path = self.config["output_dir"] / "processing_results.json"
-        with open(json_path, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-
-        results["report"] = {
-            "html": str(report_path),
-            "json": str(json_path)
-        }
-
-        self.console.print(f"[green]Educational report saved to {report_path}[/green]")
-
     def _interactive_checkpoint(self, stage: str, data: Dict):
         """Interactive checkpoint for learning mode."""
         self.console.print(Panel.fit(
             f"[bold yellow]Interactive Checkpoint: {stage}[/bold yellow]\n"
-            "Press Enter to continue, 'a' to analyze, 'v' to visualize, or 'q' to quit.",
+            "Press Enter to continue, 'a' to analyze, or 'q' to quit.",
             title="🎓 Learning Mode"
         ))
 
@@ -438,10 +473,7 @@ class EducationalAudioPipeline:
             sys.exit(0)
         elif choice == 'a':
             self._display_analysis(data)
-            self._interactive_checkpoint(stage, data)  # Re-prompt
-        elif choice == 'v':
-            self._display_visualization(data)
-            self._interactive_checkpoint(stage, data)  # Re-prompt
+            self._interactive_checkpoint(stage, data)
 
     def _display_analysis(self, data: Dict):
         """Display detailed analysis of current data."""
@@ -456,22 +488,6 @@ class EducationalAudioPipeline:
                 table.add_row(key, value[:50] + "..." if len(value) > 50 else value)
 
         self.console.print(table)
-
-    def _display_visualization(self, data: Dict):
-        """Display visualization of current data."""
-        if "audio" in data or "waveform" in data:
-            audio = data.get("audio", data.get("waveform"))
-            sr = data.get("sample_rate", self.config["sample_rate"])
-
-            # Create temporary visualization
-            viz_path = self.config["temp_dir"] / "interactive_viz.png"
-            self.visualizer.create_combined_plot(audio, sr, viz_path)
-
-            self.console.print(f"[green]Visualization saved to {viz_path}[/green]")
-
-            # Try to open in default viewer (macOS)
-            import subprocess
-            subprocess.run(["open", str(viz_path)])
 
     def _progress_callback(self, progress: float, message: str):
         """Callback for progress updates during processing."""
@@ -497,14 +513,20 @@ class EducationalAudioPipeline:
         table.add_column("Stage", style="cyan")
         table.add_column("Status", style="green")
         table.add_column("Time (s)", style="yellow")
+        table.add_column("Quality", style="magenta")
 
         for stage, data in results["stages"].items():
             time_taken = data.get("processing_time", "-")
             if isinstance(time_taken, float):
                 time_taken = f"{time_taken:.2f}"
-            table.add_row(stage.capitalize(), "✓ Complete", str(time_taken))
 
-        table.add_row("Total", "Complete", f"{results['total_time']:.2f}")
+            quality = "-"
+            if stage == "separation":
+                quality = f"SNR: {data.get('snr_db', 0):.1f}dB"
+
+            table.add_row(stage.capitalize(), "✓ Complete", str(time_taken), quality)
+
+        table.add_row("Total", "Complete", f"{results['total_time']:.2f}", "-")
 
         self.console.print("\n")
         self.console.print(table)
@@ -539,11 +561,21 @@ def main():
     parser.add_argument("--separator", default="demucs",
                         choices=["demucs"],
                         help="Source separator model")
-    parser.add_argument("--demucs-model", default="htdemucs_6s",
+    parser.add_argument("--demucs-model", default="htdemucs_ft",
                         choices=["htdemucs", "htdemucs_ft", "htdemucs_6s"],
                         help="Demucs model variant")
     parser.add_argument("--audiocraft-model", default="musicgen-medium",
                         help="AudioCraft model to use")
+
+    # Quality settings
+    parser.add_argument("--shifts", type=int, default=6,
+                        help="Number of shifts for separation quality (default: 6, use 1-10)")
+    parser.add_argument("--overlap", type=float, default=0.25,
+                        help="Overlap factor for separation (default: 0.25, use 0.5 for higher quality)")
+    parser.add_argument("--fast", action="store_true",
+                        help="Use fast settings (lower quality but faster)")
+    parser.add_argument("--high-quality", action="store_true",
+                        help="Use high quality settings (slower but better results)")
 
     # Features
     parser.add_argument("--interactive", action="store_true",
@@ -552,16 +584,12 @@ def main():
                         help="Enable educational features (default: True)")
     parser.add_argument("--analyze", action="store_true", default=True,
                         help="Perform detailed analysis")
-    parser.add_argument("--visualize", action="store_true", default=True,
-                        help="Generate visualizations")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output")
 
     # Batch processing
     parser.add_argument("--batch", type=Path,
                         help="Batch process directory")
-    parser.add_argument("--compare-models", action="store_true",
-                        help="Compare different model outputs")
 
     # API configuration
     parser.add_argument("--deepseek-api-key",
@@ -575,22 +603,38 @@ def main():
         "[dim]Learn advanced AI audio processing with Meta's latest models[/dim]\n\n"
         f"📂 Input: {args.input}\n"
         f"🎛️ Mode: {args.mode}\n"
-        f"🤖 Models: Demucs v4 + AudioCraft + DDSP",
+        f"🤖 Models: Demucs v4 + AudioCraft + DDSP\n"
+        f"📊 Quality Focus: SNR optimization",
         title="🎵 Welcome to Audio AI Learning Lab",
         border_style="magenta"
     ))
 
-    # Prepare configuration
+    # Prepare configuration with quality settings
+    if args.fast:
+        shifts = 3
+        overlap = 0.25
+        model = "htdemucs_ft"
+    elif args.high_quality:
+        shifts = 10
+        overlap = 0.5
+        model = "htdemucs_6s"
+    else:
+        shifts = args.shifts
+        overlap = args.overlap
+        model = args.demucs_model
+
     config = {
         "output_dir": args.output,
-        "temp_dir": Path("temp"),  # Add this line
-        "models_dir": Path("models"),  # Add this line
+        "temp_dir": Path("temp"),
+        "models_dir": Path("models"),
         "educational_mode": args.educational,
         "verbose": args.verbose,
-        "visualization": args.visualize,
+        "visualization": False,
         "analysis": args.analyze,
         "demucs": {
-            "model": args.demucs_model,
+            "model": model,
+            "shifts": shifts,
+            "overlap": overlap,
         },
         "audiocraft": {
             "model": args.audiocraft_model,
@@ -617,10 +661,6 @@ def main():
             console.print(f"\n[bold]Processing: {audio_file.name}[/bold]")
             results = pipeline.process_audio(audio_file, args.mode, args.interactive)
             results_list.append(results)
-
-        # Generate comparison report if requested
-        if args.compare_models:
-            pipeline.reporter.generate_comparison_report(results_list)
     else:
         # Single file processing
         results = pipeline.process_audio(args.input, args.mode, args.interactive)
