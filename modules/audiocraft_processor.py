@@ -155,3 +155,37 @@ class AudioCraftProcessor:
                     "error": str(e)
                 }
             }
+
+    async def transform_with_conditioning(self,
+                                          audio: torch.Tensor,
+                                          prompt: str,
+                                          conditioning_audio: Optional[torch.Tensor] = None,
+                                          temperature: float = 0.7) -> torch.Tensor:
+        """Apply MusicGen with conditioning for consistent style."""
+
+        self.model.set_generation_params(
+            duration=audio.shape[-1] / self.model.sample_rate,
+            temperature=temperature,
+            top_k=250,
+            cfg_coef=3.0,  # Classifier-free guidance strength
+            two_step_cfg=True  # Better quality
+        )
+
+        if conditioning_audio is not None:
+            # Use melody conditioning for style consistency
+            with torch.no_grad():
+                output = self.model.generate_with_chroma(
+                    descriptions=[prompt],
+                    melody_wavs=conditioning_audio.unsqueeze(0),
+                    melody_sample_rate=self.model.sample_rate,
+                    progress=True
+                )
+        else:
+            # Standard generation
+            with torch.no_grad():
+                output = self.model.generate(
+                    descriptions=[prompt],
+                    progress=True
+                )
+
+        return output[0]

@@ -39,3 +39,7 @@ click>=8.1.0
 # Optional: For Jupyter notebook support
 jupyter>=1.0.0
 ipywidgets>=8.0.0
+
+music21>=8.0.0  # For harmonic analysis
+pyrubberband>=0.3.0
+sounddevice==0.4.6

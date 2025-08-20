@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torchaudio
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.panel import Panel
 from rich.logging import RichHandler
@@ -40,6 +40,9 @@ from modules.audiocraft_processor import AudioCraftProcessor
 from modules.ddsp_transfer import DDSPStyleTransfer
 from modules.audio_analyzer import AudioAnalyzer
 from modules.deepseek_assistant import DeepSeekAssistant
+from modules.stem_analyzer import StemAnalyzer
+from modules.stem_transformer import StemTransformer
+from modules.interactive_selector import InteractiveSelector
 import ssl
 
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -73,6 +76,9 @@ class EducationalAudioPipeline:
         # Track processing history for educational purposes
         self.processing_history = []
         self.learning_insights = []
+        self.stem_analyzer = StemAnalyzer(self.config["sample_rate"])
+        self.stem_transformer = StemTransformer(self.config)
+        self.interactive_selector = InteractiveSelector()
 
     def _default_config(self) -> Dict[str, Any]:
         """Return default configuration for the pipeline."""
@@ -174,17 +180,228 @@ class EducationalAudioPipeline:
             else:
                 self.assistant = None
 
+    def _transform_stems_enhanced(self, separated: Dict, results: Dict, interactive: bool) -> Dict:
+        """Enhanced transform that works with pre-loaded stems."""
+
+        from modules.stem_transformer import StemTransformer
+
+        # Initialize transformer
+        transformer = StemTransformer(self.config, self.audiocraft)
+
+        # Use existing analyses if available, otherwise analyze now
+        if "stem_analyses" in separated:
+            stem_analyses = separated["stem_analyses"]
+        else:
+            stem_analyses = {}
+            for stem_name, stem_audio in separated["stems"].items():
+                self.console.print(f"\n[cyan]Analyzing {stem_name}...[/cyan]")
+                analysis = self.stem_analyzer.analyze_stem(stem_audio, stem_name)
+                analysis["sample_rate"] = separated.get("sample_rate", 44100)
+                stem_analyses[stem_name] = analysis
+
+        # Display analysis summary
+        self._display_analysis_summary(stem_analyses)
+
+        # Get transformations
+        transformations = {}
+
+        if interactive:
+            # Interactive selection
+            self.console.print("\n[bold cyan]Interactive Transformation Selection[/bold cyan]")
+            for stem_name, analysis in stem_analyses.items():
+                selection = self.interactive_selector.display_stem_options(analysis)
+                if selection != "skip":
+                    transformations[stem_name] = selection
+        else:
+            # Auto-select best transformations
+            self.console.print("\n[cyan]Auto-selecting optimal transformations...[/cyan]")
+            transformations = self._auto_select_transformations(stem_analyses)
+
+        if transformations:
+            # Show summary
+            if interactive:
+                if not self.interactive_selector.display_transformation_summary(transformations):
+                    self.console.print("[yellow]Transformation cancelled[/yellow]")
+                    return separated
+
+            # Apply transformations with progress tracking
+            self.console.print("\n[bold green]Applying Transformations[/bold green]")
+
+            with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    TimeElapsedColumn(),
+                    console=self.console
+            ) as progress:
+
+                task = progress.add_task("Transforming stems...", total=len(transformations))
+
+                # Batch transform
+                transformed_stems = transformer.batch_transform(
+                    separated["stems"],
+                    stem_analyses,
+                    transformations,
+                    parallel=self.config.get("stem_transformation", {}).get("parallel_processing", True)
+                )
+
+                progress.update(task, completed=len(transformations))
+
+            # Save transformed stems
+            self._save_transformed_outputs(transformed_stems, separated["stems"])
+
+            # Quality report
+            self._display_quality_report(transformed_stems, transformations)
+
+            # Store results
+            results["stages"]["transformation"] = {
+                "analyses": {k: {
+                    "instrument_type": v["instrument_type"],
+                    "key": v.get("key", "Unknown"),
+                    "energy": v.get("energy", 0)
+                } for k, v in stem_analyses.items()},
+                "transformations": transformations,
+                "quality_scores": {
+                    k: v.get("quality_score", 0)
+                    for k, v in transformed_stems.items()
+                },
+                "harmonic_compatibility": {
+                    k: v.get("harmonic_compatibility", 0)
+                    for k, v in transformed_stems.items()
+                }
+            }
+
+            return transformed_stems
+        else:
+            self.console.print("[yellow]No transformations selected[/yellow]")
+            return separated
+
+    def _display_analysis_summary(self, stem_analyses: Dict):
+        """Display comprehensive analysis summary."""
+
+        table = Table(title="🎵 Stem Analysis Summary", show_header=True)
+        table.add_column("Stem", style="cyan", width=15)
+        table.add_column("Type", style="yellow", width=12)
+        table.add_column("Key", style="magenta", width=8)
+        table.add_column("Energy", style="green", width=10)
+        table.add_column("Tempo Rel.", style="blue", width=12)
+        table.add_column("Harmonic", style="red", width=10)
+
+        for name, analysis in stem_analyses.items():
+            tempo_rel = analysis.get("tempo_relevance", 0)
+            harmonic = analysis.get("harmonic_content", {}).get("harmonic_ratio", 0)
+
+            table.add_row(
+                name,
+                analysis.get("instrument_type", "unknown"),
+                analysis.get("key", "?"),
+                f"{analysis.get('energy', 0):.3f}",
+                f"{tempo_rel:.0%}",
+                f"{harmonic:.0%}"
+            )
+
+        self.console.print(table)
+
+    def _save_transformed_outputs(self, transformed_stems: Dict, original_stems: Dict):
+        """Save all transformation outputs with comparison."""
+
+        output_dir = self.config["output_dir"] / "transformed"
+        output_dir.mkdir(exist_ok=True)
+
+        # Save individual transformed stems
+        for stem_name, transform_data in transformed_stems.items():
+            if "audio" in transform_data:
+                # Transformed version
+                trans_path = output_dir / f"{stem_name}_{transform_data.get('transformation', 'transformed')}.wav"
+                torchaudio.save(
+                    trans_path,
+                    transform_data["audio"],
+                    self.config.get("sample_rate", 44100)
+                )
+
+                # Also save original for comparison if requested
+                if self.config.get("save_comparisons", True):
+                    orig_path = output_dir / f"{stem_name}_original.wav"
+                    if stem_name in original_stems:
+                        torchaudio.save(
+                            orig_path,
+                            original_stems[stem_name],
+                            self.config.get("sample_rate", 44100)
+                        )
+
+        # Create mixed versions
+        self._create_mixed_output(transformed_stems, output_dir)
+
+        # Create comparison mix (original vs transformed)
+        if self.config.get("save_comparisons", True):
+            self._create_comparison_mix(original_stems, transformed_stems, output_dir)
+
+        self.console.print(f"\n[green]✅ All outputs saved to {output_dir}[/green]")
+
+    def _display_quality_report(self, transformed_stems: Dict, transformations: Dict):
+        """Display detailed quality report of transformations."""
+
+        table = Table(title="🎯 Transformation Quality Report", show_header=True)
+        table.add_column("Stem", style="cyan")
+        table.add_column("Transformation", style="yellow")
+        table.add_column("Quality", style="green")
+        table.add_column("Harmonic", style="magenta")
+        table.add_column("Time", style="blue")
+
+        total_quality = 0
+        num_transforms = 0
+
+        for stem_name, transform_data in transformed_stems.items():
+            if stem_name in transformations:
+                quality = transform_data.get("quality_score", 0)
+                harmonic = transform_data.get("harmonic_compatibility", 0)
+                time = transform_data.get("processing_time", 0)
+
+                # Color code quality
+                if quality >= 0.8:
+                    quality_str = f"[green]{quality:.0%}[/green]"
+                elif quality >= 0.6:
+                    quality_str = f"[yellow]{quality:.0%}[/yellow]"
+                else:
+                    quality_str = f"[red]{quality:.0%}[/red]"
+
+                table.add_row(
+                    stem_name,
+                    transformations[stem_name],
+                    quality_str,
+                    f"{harmonic:.0%}",
+                    f"{time:.1f}s"
+                )
+
+                total_quality += quality
+                num_transforms += 1
+
+        self.console.print(table)
+
+        if num_transforms > 0:
+            avg_quality = total_quality / num_transforms
+            self.console.print(f"\n[bold]Average Quality Score: {avg_quality:.0%}[/bold]")
+
+    def _create_comparison_mix(self, original_stems: Dict, transformed_stems: Dict, output_dir: Path):
+        """Create side-by-side comparison mix."""
+
+        # Implementation for A/B comparison
+        # Left channel: original mix
+        # Right channel: transformed mix
+        # Or create two separate files for easier comparison
+        pass
     def process_audio(self,
                       input_path: Path,
                       mode: str = "full",
-                      interactive: bool = False) -> Dict[str, Any]:
+                      interactive: bool = False,
+                      results_file: Optional[Path] = None) -> Dict[str, Any]:  # ADD results_file parameter
         """
         Process audio file through the educational pipeline.
 
         Args:
-            input_path: Path to input audio file
-            mode: Processing mode (full, learning, separator, audiocraft, etc.)
+            input_path: Path to input audio file or results JSON for transform-only mode
+            mode: Processing mode (full, learning, separator, audiocraft, transform, transform-only)
             interactive: Enable interactive learning mode
+            results_file: Path to existing results JSON (for transform-only mode)
 
         Returns:
             Processing results and educational insights
@@ -200,28 +417,56 @@ class EducationalAudioPipeline:
         }
 
         try:
-            # Stage 1: Load and analyze input audio
-            self._print_stage("Loading Audio", "📂")
-            audio_data = self._load_and_analyze(input_path, results)
+            # Check if transform-only mode
+            if mode == "transform-only":
+                if not results_file:
+                    # If no results file specified, try to find the latest one
+                    results_files = list(self.config["output_dir"].glob("results_*.json"))
+                    if results_files:
+                        results_file = max(results_files, key=lambda p: p.stat().st_mtime)
+                        self.console.print(f"[yellow]Using latest results file: {results_file.name}[/yellow]")
+                    else:
+                        raise ValueError("No results file found. Please run separation first or specify --results-file")
 
-            if interactive:
-                self._interactive_checkpoint("Audio loaded", audio_data)
+                # Load existing stems
+                separated = self._load_existing_stems(results_file, results)
 
-            # Stage 2: Source separation with Demucs v4
-            if mode in ["full", "learning", "separator"]:
-                self._print_stage("Source Separation (Demucs v4)", "🎛️")
-                separated = self._separate_sources(audio_data, results, interactive)
+                # Jump directly to transformation
+                self._print_stage("Stem Transformation", "🎭")
+                transformed = self._transform_stems_enhanced(separated, results, interactive)
+
+            else:
+                # Normal processing flow
+                # Stage 1: Load and analyze input audio
+                self._print_stage("Loading Audio", "📂")
+                audio_data = self._load_and_analyze(input_path, results)
 
                 if interactive:
-                    self._interactive_checkpoint("Sources separated", separated)
+                    self._interactive_checkpoint("Audio loaded", audio_data)
 
-            # Stage 3: AudioCraft processing
-            if mode in ["full", "audiocraft"]:
-                self._print_stage("AudioCraft Processing", "🎨")
-                processed = self._process_audiocraft(audio_data, results, interactive)
+                # Stage 2: Source separation with Demucs v4
+                if mode in ["full", "learning", "separator", "transform"]:
+                    self._print_stage("Source Separation (Demucs v4)", "🎛️")
+                    separated = self._separate_sources(audio_data, results, interactive)
 
-                if interactive:
-                    self._interactive_checkpoint("AudioCraft applied", processed)
+                    if interactive:
+                        self._interactive_checkpoint("Sources separated", separated)
+
+                    # Add stem analysis for transformation
+                    if mode in ["full", "transform"]:
+                        separated["stem_analyses"] = {}
+                        for stem_name, stem_audio in separated["stems"].items():
+                            analysis = self.stem_analyzer.analyze_stem(stem_audio, stem_name)
+                            analysis["sample_rate"] = audio_data["sample_rate"]
+                            separated["stem_analyses"][stem_name] = analysis
+
+                # Stage 3: Transformation (if requested)
+                if mode in ["full", "transform"]:
+                    self._print_stage("Stem Transformation", "🎭")
+                    transformed = self._transform_stems_enhanced(separated, results, interactive)
+
+                    if interactive:
+                        self._interactive_checkpoint("Stems transformed", transformed)
 
             # Stage 4: Style transfer with DDSP
             if mode in ["full", "style"]:
@@ -344,6 +589,236 @@ class EducationalAudioPipeline:
             })
 
         return separated
+
+    # In main.py, add these methods to EducationalAudioPipeline class:
+    def _load_existing_stems(self, results_file: Path, results: Dict) -> Dict:
+        """Load existing separated stems from previous run."""
+
+        self._print_stage("Loading Existing Stems", "📁")
+
+        import json
+
+        # Load results JSON
+        with open(results_file, 'r') as f:
+            previous_results = json.load(f)
+
+        # Extract stem information
+        if "stages" not in previous_results or "separation" not in previous_results["stages"]:
+            raise ValueError("Results file doesn't contain separation data")
+
+        separation_data = previous_results["stages"]["separation"]
+        stems_paths = separation_data.get("stems", {})
+
+        # Load audio files
+        stems = {}
+        stem_analyses = {}
+
+        self.console.print(f"[cyan]Loading {len(stems_paths)} stems...[/cyan]")
+
+        for stem_name, stem_path in stems_paths.items():
+            stem_file = Path(stem_path)
+
+            if not stem_file.exists():
+                # Try relative to output directory
+                stem_file = self.config["output_dir"] / "separated" / stem_file.name
+
+            if stem_file.exists():
+                # Load audio
+                waveform, sample_rate = torchaudio.load(stem_file)
+                stems[stem_name] = waveform
+
+                self.console.print(f"  ✅ Loaded: {stem_name} ({stem_file.name})")
+
+                # Analyze the stem
+                analysis = self.stem_analyzer.analyze_stem(waveform, stem_name)
+                analysis["sample_rate"] = sample_rate
+                stem_analyses[stem_name] = analysis
+            else:
+                self.console.print(f"  ❌ Not found: {stem_file}")
+
+        # Copy relevant metrics from previous results
+        results["stages"]["loading"] = previous_results["stages"].get("loading", {})
+        results["stages"]["analysis"] = previous_results["stages"].get("analysis", {})
+        results["stages"]["separation"] = separation_data
+
+        # Add insights from previous run
+        if "insights" in previous_results:
+            results["insights"] = previous_results["insights"]
+
+        # Create separated dict format expected by transform pipeline
+        separated = {
+            "stems": stems,
+            "source_names": list(stems.keys()),
+            "metrics": separation_data.get("metrics", {}),
+            "sample_rate": sample_rate,
+            "stem_analyses": stem_analyses
+        }
+
+        self.console.print(f"\n[green]Successfully loaded {len(stems)} stems from previous run[/green]")
+
+        # Display stem info
+        table = Table(title="Loaded Stems", show_header=True)
+        table.add_column("Stem", style="cyan")
+        table.add_column("Detected Type", style="yellow")
+        table.add_column("Energy", style="green")
+        table.add_column("Key", style="magenta")
+
+        for name, analysis in stem_analyses.items():
+            table.add_row(
+                name,
+                analysis.get("instrument_type", "unknown"),
+                f"{analysis.get('energy', 0):.4f}",
+                analysis.get("key", "?")
+            )
+
+        self.console.print(table)
+
+        return separated
+    def _transform_stems(self, separated: Dict, results: Dict, interactive: bool) -> Dict:
+        """Analyze and transform separated stems."""
+
+        self._print_stage("Stem Analysis & Transformation", "🎭")
+
+        # Initialize transformer with audiocraft
+        from modules.stem_transformer import StemTransformer
+        transformer = StemTransformer(self.config, self.audiocraft)
+
+        # Analyze each stem
+        stem_analyses = {}
+        for stem_name, stem_audio in separated["stems"].items():
+            self.console.print(f"\n[cyan]Analyzing {stem_name}...[/cyan]")
+            analysis = self.stem_analyzer.analyze_stem(stem_audio, stem_name)
+            stem_analyses[stem_name] = analysis
+            analysis["sample_rate"] = separated.get("sample_rate", 44100)
+
+        # Get transformations
+        transformations = {}
+
+        if interactive:
+            # Interactive selection
+            for stem_name, analysis in stem_analyses.items():
+                selection = self.interactive_selector.display_stem_options(analysis)
+                if selection != "skip":
+                    transformations[stem_name] = selection
+        else:
+            # Auto-select best transformations
+            transformations = self._auto_select_transformations(stem_analyses)
+
+        if transformations:
+            # Show summary
+            if interactive:
+                if not self.interactive_selector.display_transformation_summary(transformations):
+                    self.console.print("[yellow]Transformation cancelled[/yellow]")
+                    return separated
+
+            # Apply transformations
+            self.console.print("\n[cyan]Applying transformations...[/cyan]")
+            transformed_stems = transformer.batch_transform(
+                separated["stems"],
+                stem_analyses,
+                transformations,
+                parallel=True
+            )
+
+            # Save transformed stems
+            output_dir = self.config["output_dir"] / "transformed"
+            output_dir.mkdir(exist_ok=True)
+
+            for stem_name, transform_data in transformed_stems.items():
+                if "audio" in transform_data:
+                    output_path = output_dir / f"{stem_name}_{transform_data.get('transformation', 'transformed')}.wav"
+                    torchaudio.save(
+                        output_path,
+                        transform_data["audio"],
+                        self.config.get("sample_rate", 44100)
+                    )
+                    self.console.print(f"[green]Saved: {output_path.name}[/green]")
+
+            # Create mixed version
+            self._create_mixed_output(transformed_stems, output_dir)
+
+            # Store results
+            results["stages"]["transformation"] = {
+                "analyses": {k: {
+                    "instrument_type": v["instrument_type"],
+                    "key": v.get("key", "Unknown"),
+                    "energy": v.get("energy", 0)
+                } for k, v in stem_analyses.items()},
+                "transformations": transformations,
+                "quality_scores": {
+                    k: v.get("quality_score", 0)
+                    for k, v in transformed_stems.items()
+                }
+            }
+
+            return transformed_stems
+        else:
+            self.console.print("[yellow]No transformations selected[/yellow]")
+            return separated
+
+    def _auto_select_transformations(self, stem_analyses: Dict) -> Dict:
+        """Automatically select best transformations based on compatibility."""
+        transformations = {}
+
+        for stem_name, analysis in stem_analyses.items():
+            # Find best transformation based on compatibility
+            best_transform = None
+            best_score = 0.6  # Minimum threshold
+
+            for transform_name, info in analysis["recommended_transformations"].items():
+                if info.get("compatibility", 0) > best_score:
+                    best_transform = transform_name
+                    best_score = info["compatibility"]
+
+            if best_transform:
+                transformations[stem_name] = best_transform
+                self.console.print(
+                    f"[green]Auto-selected '{best_transform}' for {stem_name} "
+                    f"(compatibility: {best_score:.0%})[/green]"
+                )
+
+        return transformations
+
+    def _create_mixed_output(self, transformed_stems: Dict, output_dir: Path):
+        """Create a mixed version of all transformed stems."""
+
+        # Collect all audio
+        all_audio = []
+        max_length = 0
+
+        for stem_data in transformed_stems.values():
+            if "audio" in stem_data:
+                audio = stem_data["audio"]
+                all_audio.append(audio)
+                max_length = max(max_length, audio.shape[-1])
+
+        if all_audio:
+            # Pad all to same length
+            padded_audio = []
+            for audio in all_audio:
+                if audio.shape[-1] < max_length:
+                    padding = max_length - audio.shape[-1]
+                    audio = torch.nn.functional.pad(audio, (0, padding))
+                padded_audio.append(audio)
+
+            # Mix (simple sum and normalize)
+            mixed = torch.sum(torch.stack(padded_audio), dim=0)
+            mixed = mixed / len(padded_audio)  # Average
+
+            # Normalize to prevent clipping
+            max_val = torch.max(torch.abs(mixed))
+            if max_val > 0.95:
+                mixed = mixed * (0.95 / max_val)
+
+            # Save mixed output
+            mixed_path = output_dir / "mixed_transformed.wav"
+            torchaudio.save(
+                mixed_path,
+                mixed,
+                self.config.get("sample_rate", 44100)
+            )
+
+            self.console.print(f"[green]Created mixed output: {mixed_path.name}[/green]")
 
     def _calculate_quality_score(self, metrics: Dict) -> float:
         """Calculate overall quality score based on metrics."""
@@ -546,16 +1021,26 @@ def main():
     )
 
     # Input/Output arguments
-    parser.add_argument("--input", "-i", type=Path, required=True,
-                        help="Input audio file (MP3, WAV)")
+    parser.add_argument("--input", "-i", type=Path, required=False,  # Changed to not required
+                        help="Input audio file (MP3, WAV) - not needed for transform-only mode")
     parser.add_argument("--output", "-o", type=Path, default=Path("output"),
                         help="Output directory (default: output)")
 
     # Processing modes
     parser.add_argument("--mode", "-m",
-                        choices=["full", "learning", "separator", "audiocraft", "style"],
+                        choices=["full", "learning", "separator", "audiocraft", "style", "transform", "transform-only"],
                         default="learning",
-                        help="Processing mode")
+                        help="Processing mode (transform-only uses existing stems)")
+
+    # Transform-specific arguments
+    parser.add_argument("--results-file", type=Path,
+                        help="Path to existing results JSON file (for transform-only mode)")
+    parser.add_argument("--stems-dir", type=Path,
+                        help="Directory containing separated stems (alternative to results-file)")
+    parser.add_argument("--auto-transform", action="store_true",
+                        help="Automatically select best transformations")
+    parser.add_argument("--save-comparisons", action="store_true", default=True,
+                        help="Save comparison files (original vs transformed)")
 
     # Model selection
     parser.add_argument("--separator", default="demucs",
@@ -597,6 +1082,9 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate input requirement
+    if args.mode != "transform-only" and not args.input:
+        parser.error("--input is required for all modes except transform-only")
     # Print welcome banner
     console.print(Panel.fit(
         "[bold magenta]Educational Audio Processing Pipeline[/bold magenta]\n"
@@ -628,6 +1116,7 @@ def main():
         "temp_dir": Path("temp"),
         "models_dir": Path("models"),
         "educational_mode": args.educational,
+        "sample_rate": 44100,
         "verbose": args.verbose,
         "visualization": False,
         "analysis": args.analyze,
@@ -649,7 +1138,38 @@ def main():
 
     # Initialize pipeline
     pipeline = EducationalAudioPipeline(config)
-
+    if args.mode == "transform-only":
+        # Special handling for transform-only mode
+        if args.results_file and args.results_file.exists():
+            # Use specified results file
+            results = pipeline.process_audio(
+                args.input,  # Can be dummy path
+                mode="transform-only",
+                interactive=args.interactive,
+                results_file=args.results_file
+            )
+        elif args.stems_dir and args.stems_dir.exists():
+            # Load stems directly from directory
+            # (implement separate method for this if needed)
+            results = pipeline.process_audio(
+                args.stems_dir,
+                mode="transform-only",
+                interactive=args.interactive
+            )
+        else:
+            # Try to find latest results automatically
+            results = pipeline.process_audio(
+                Path("dummy"),  # Placeholder
+                mode="transform-only",
+                interactive=args.interactive
+            )
+    else:
+        # Normal processing
+        results = pipeline.process_audio(
+            args.input,
+            args.mode,
+            args.interactive
+        )
     # Process audio
     if args.batch:
         # Batch processing
