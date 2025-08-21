@@ -70,29 +70,3 @@ class DeepSeekAssistant:
 
         response = self._query(prompt)
         return response or f"Source separation completed using {model}."
-
-    def explain_audiocraft_processing(self, config: Dict, metrics: Dict) -> str:
-        """Explain AudioCraft processing."""
-        prompt = f"""
-        Explain the AudioCraft processing with model {config['model']}:
-        - Temperature: {config['temperature']}
-        - Duration: {metrics.get('duration', 0):.2f} seconds
-
-        What do these parameters control and how do they affect the output?
-        """
-
-        response = self._query(prompt)
-        return response or "AudioCraft processing applied successfully."
-
-    def explain_style_transfer(self, config: Dict, metrics: Dict) -> str:
-        """Explain DDSP style transfer."""
-        prompt = f"""
-        Explain DDSP style transfer to {config['checkpoint']} instrument:
-        - Pitch shift: {config['pitch_shift']} semitones
-        - Loudness shift: {config['loudness_shift']} dB
-
-        How does DDSP achieve timbre transfer?
-        """
-
-        response = self._query(prompt)
-        return response or f"Style transfer to {config['checkpoint']} completed."
