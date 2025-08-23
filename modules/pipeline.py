@@ -1,8 +1,3 @@
-"""
-Separation Pipeline - Core processing logic
-==========================================
-Main pipeline orchestrator for educational audio source separation.
-"""
 
 import json
 import time
@@ -18,7 +13,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 from .audio_loader import AudioLoader
-from .demucs_separator import DemucsSeparator
+from .demucs_separator import EnhancedDemucsSeparator
 from .audio_analyzer import AudioAnalyzer
 from .deepseek_assistant import DeepSeekAssistant
 from .visualization import AudioVisualizer
@@ -28,8 +23,7 @@ console = Console()
 
 class SeparationPipeline:
     """
-    Main pipeline orchestrator for educational audio source separation.
-    Focuses on high-quality stem separation with detailed analysis.
+    Main pipeline orchestrator for enhanced audio source separation.
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -40,7 +34,7 @@ class SeparationPipeline:
 
     def _initialize_components(self):
         """Initialize all pipeline components."""
-        self.console.print("🚀 Initializing pipeline components...")
+        self.console.print("🚀 Initializing enhanced pipeline components...")
 
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as progress:
             # Create directories
@@ -53,8 +47,8 @@ class SeparationPipeline:
             self.audio_loader = AudioLoader(self.config)
             progress.update(task2, advance=100)
 
-            task3 = progress.add_task("Loading Demucs v4...", total=100)
-            self.separator = DemucsSeparator(self.config)
+            task3 = progress.add_task("Loading Enhanced Demucs with pre/post processing...", total=100)
+            self.separator = EnhancedDemucsSeparator(self.config)  # Use enhanced separator
             progress.update(task3, advance=100)
 
             task4 = progress.add_task("Preparing analyzer...", total=100)
@@ -88,7 +82,7 @@ class SeparationPipeline:
             Path(dir_path).mkdir(parents=True, exist_ok=True)
 
     def process_audio(self, input_path: Path, mode: str = "learning", interactive: bool = False) -> Dict[str, Any]:
-        """Process a single audio file."""
+        """Process a single audio file with enhanced separation."""
         start_time = time.time()
 
         results = {
@@ -112,13 +106,13 @@ class SeparationPipeline:
                 self._print_stage("Creating Visualizations", "📊")
                 self._create_visualizations(audio_data, results)
 
-            # Stage 3: Separation
+            # Stage 3: Enhanced Separation (no vocals)
             if mode in ["full", "learning", "separator"]:
-                self._print_stage("Source Separation", "🎛️")
+                self._print_stage("Enhanced Source Separation (Instrumental Only)", "🎛️")
                 separated = self._separate_sources(audio_data, results, interactive)
 
                 if mode in ["full", "learning"]:
-                    self._print_stage("Analyzing Stems", "🔬")
+                    self._print_stage("Analyzing Instrumental Stems", "🔬")
                     self._analyze_stems(separated, results)
 
             results["total_time"] = time.time() - start_time
@@ -145,7 +139,7 @@ class SeparationPipeline:
         for audio_file in audio_files:
             console.print(f"\n[bold]Processing: {audio_file.name}[/bold]")
             try:
-                result = self.process_audio(audio_file, mode, False)  # No interactive for batch
+                result = self.process_audio(audio_file, mode, False)
                 results_list.append(result)
             except Exception as e:
                 console.print(f"[red]Failed: {e}[/red]")
@@ -211,10 +205,10 @@ class SeparationPipeline:
         }
 
     def _separate_sources(self, audio_data: Dict, results: Dict, interactive: bool) -> Dict:
-        """Perform source separation."""
+        """Perform enhanced source separation."""
         # Progress tracking
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as progress:
-            task = progress.add_task("Separating...", total=100)
+            task = progress.add_task("Enhanced separation...", total=100)
 
             def progress_callback(prog: float, msg: str):
                 progress.update(task, completed=int(prog * 100), description=msg)
@@ -223,7 +217,7 @@ class SeparationPipeline:
                 audio_data["waveform"], audio_data["sample_rate"], progress_callback
             )
 
-        # Save stems
+        # Save instrumental stems only (no vocals)
         stem_paths = self._save_stems(separated["stems"], audio_data)
 
         # Create stem visualizations
@@ -234,7 +228,8 @@ class SeparationPipeline:
             "model": self.config["demucs"]["model"],
             "stems": stem_paths,
             "metrics": separated.get("metrics", {}),
-            "processing_time": separated.get("processing_time", 0)
+            "processing_time": separated.get("processing_time", 0),
+            "enhanced_processing": True
         }
 
         self._display_separation_metrics(separated.get("metrics", {}))
@@ -335,11 +330,17 @@ class SeparationPipeline:
         table.add_column("Value", style="green")
         table.add_column("Grade", style="yellow")
 
-        snr = metrics.get("reconstruction_snr", 0)
-        quality_grade = self._get_quality_grade(snr)
+        snr = metrics.get("snr_db", 0)
+        quality_score = metrics.get("quality_score", 0)
 
-        table.add_row("SNR", f"{snr:.2f} dB", quality_grade)
+        table.add_row("SNR", f"{snr:.2f} dB", self._get_quality_grade(snr))
+        table.add_row("Quality Score", f"{quality_score:.1f}/100", self._get_score_grade(quality_score))
         table.add_row("Stems", str(metrics.get("num_stems", 0)), "-")
+
+        # Show sub-stems if created
+        if metrics.get("num_stems", 0) > 3:
+            table.add_row("Enhanced Mode", "Yes", "✓")
+            table.add_row("Sub-stems Created", "Keys, Guitar, Synth", "✓")
 
         console.print(table)
 
@@ -439,3 +440,17 @@ class SeparationPipeline:
             return "C"
         else:
             return "D"
+
+    def _get_score_grade(self, score: float) -> str:
+        if score >= 90:
+            return "Exceptional"
+        elif score >= 80:
+            return "Excellent"
+        elif score >= 70:
+            return "Very Good"
+        elif score >= 60:
+            return "Good"
+        elif score >= 50:
+            return "Fair"
+        else:
+            return "Needs Improvement"
