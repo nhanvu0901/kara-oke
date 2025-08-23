@@ -194,8 +194,15 @@ class EnhancedDemucsSeparator:
 
             # Apply filter to each channel
             audio_np = audio.cpu().numpy()
+
+            # Ensure contiguous array
+            if not audio_np.flags.c_contiguous:
+                audio_np = np.ascontiguousarray(audio_np)
+
             for ch in range(audio_np.shape[0]):
-                audio_np[ch] = signal.sosfiltfilt(sos, audio_np[ch])
+                ch_data = np.ascontiguousarray(audio_np[ch])
+                filtered = signal.sosfiltfilt(sos, ch_data)
+                audio_np[ch] = filtered.copy()
 
             audio = torch.from_numpy(audio_np).to(audio.device)
 
@@ -214,7 +221,6 @@ class EnhancedDemucsSeparator:
         bands = {}
 
         # Design filters for different frequency ranges
-        # Low: < 250 Hz (bass region, but keep for reference)
         # Low-mid: 250-1000 Hz
         # Mid: 1000-4000 Hz (important for 'other' stem)
         # High-mid: 4000-8000 Hz (presence, important for clarity)
@@ -222,37 +228,61 @@ class EnhancedDemucsSeparator:
 
         audio_np = audio.cpu().numpy()
 
+        # Ensure contiguous array to avoid negative stride issues
+        if not audio_np.flags.c_contiguous:
+            audio_np = np.ascontiguousarray(audio_np)
+
         # Low-mid band (250-1000 Hz) - important for guitars, keys lower register
         sos_lowmid = signal.butter(4, [250, 1000], 'bandpass', fs=sr, output='sos')
         bands['low_mid'] = torch.zeros_like(audio)
-        for ch in range(audio_np.shape[0]):
-            bands['low_mid'][ch] = torch.from_numpy(
-                signal.sosfiltfilt(sos_lowmid, audio_np[ch])
-            ).to(audio.device)
+        for ch in range(audio_np.shape[0] if audio_np.ndim > 1 else 1):
+            if audio_np.ndim > 1:
+                ch_data = np.ascontiguousarray(audio_np[ch])
+                filtered = signal.sosfiltfilt(sos_lowmid, ch_data)
+                bands['low_mid'][ch] = torch.from_numpy(filtered.copy()).to(audio.device)
+            else:
+                filtered = signal.sosfiltfilt(sos_lowmid, audio_np)
+                bands['low_mid'] = torch.from_numpy(filtered.copy()).to(audio.device)
+                break
 
         # Mid band (1000-4000 Hz) - critical for most melodic instruments
         sos_mid = signal.butter(4, [1000, 4000], 'bandpass', fs=sr, output='sos')
         bands['mid'] = torch.zeros_like(audio)
-        for ch in range(audio_np.shape[0]):
-            bands['mid'][ch] = torch.from_numpy(
-                signal.sosfiltfilt(sos_mid, audio_np[ch])
-            ).to(audio.device)
+        for ch in range(audio_np.shape[0] if audio_np.ndim > 1 else 1):
+            if audio_np.ndim > 1:
+                ch_data = np.ascontiguousarray(audio_np[ch])
+                filtered = signal.sosfiltfilt(sos_mid, ch_data)
+                bands['mid'][ch] = torch.from_numpy(filtered.copy()).to(audio.device)
+            else:
+                filtered = signal.sosfiltfilt(sos_mid, audio_np)
+                bands['mid'] = torch.from_numpy(filtered.copy()).to(audio.device)
+                break
 
         # High-mid band (4000-8000 Hz) - presence and clarity
         sos_highmid = signal.butter(4, [4000, 8000], 'bandpass', fs=sr, output='sos')
         bands['high_mid'] = torch.zeros_like(audio)
-        for ch in range(audio_np.shape[0]):
-            bands['high_mid'][ch] = torch.from_numpy(
-                signal.sosfiltfilt(sos_highmid, audio_np[ch])
-            ).to(audio.device)
+        for ch in range(audio_np.shape[0] if audio_np.ndim > 1 else 1):
+            if audio_np.ndim > 1:
+                ch_data = np.ascontiguousarray(audio_np[ch])
+                filtered = signal.sosfiltfilt(sos_highmid, ch_data)
+                bands['high_mid'][ch] = torch.from_numpy(filtered.copy()).to(audio.device)
+            else:
+                filtered = signal.sosfiltfilt(sos_highmid, audio_np)
+                bands['high_mid'] = torch.from_numpy(filtered.copy()).to(audio.device)
+                break
 
         # High band (> 8000 Hz) - air and brilliance
         sos_high = signal.butter(4, 8000, 'highpass', fs=sr, output='sos')
         bands['high'] = torch.zeros_like(audio)
-        for ch in range(audio_np.shape[0]):
-            bands['high'][ch] = torch.from_numpy(
-                signal.sosfiltfilt(sos_high, audio_np[ch])
-            ).to(audio.device)
+        for ch in range(audio_np.shape[0] if audio_np.ndim > 1 else 1):
+            if audio_np.ndim > 1:
+                ch_data = np.ascontiguousarray(audio_np[ch])
+                filtered = signal.sosfiltfilt(sos_high, ch_data)
+                bands['high'][ch] = torch.from_numpy(filtered.copy()).to(audio.device)
+            else:
+                filtered = signal.sosfiltfilt(sos_high, audio_np)
+                bands['high'] = torch.from_numpy(filtered.copy()).to(audio.device)
+                break
 
         return bands
 
@@ -362,16 +392,23 @@ class EnhancedDemucsSeparator:
         """Separate 'other' stem into sub-components for better quality."""
         components = {}
 
-        # Harmonic-Percussive Separation on 'other' stem
-        other_np = other_stem.cpu().numpy()
+        # Handle mono/stereo properly
+        if other_stem.dim() == 1:
+            audio_to_process = other_stem
+            original_shape = other_stem.shape
+        else:
+            # Convert to mono for processing
+            audio_to_process = torch.mean(other_stem, dim=0)
+            original_shape = other_stem.shape
 
-        # Calculate STFT
+        # Calculate STFT with proper window
+        window = torch.hann_window(4096).to(other_stem.device)
         stft = torch.stft(
-            other_stem.flatten(),
-            n_fft=4096,  # Larger FFT for better frequency resolution
+            audio_to_process,
+            n_fft=4096,
             hop_length=512,
             win_length=4096,
-            window=torch.hann_window(4096).to(other_stem.device),
+            window=window,
             return_complex=True
         )
 
@@ -383,41 +420,54 @@ class EnhancedDemucsSeparator:
 
         # Harmonic: horizontal structures in spectrogram
         harmonic_mag = torch.from_numpy(
-            signal.medfilt2d(magnitude_np, kernel_size=(1, 31))  # Horizontal filter
+            signal.medfilt2d(magnitude_np, kernel_size=(1, 31))
         ).to(magnitude.device)
 
         # Percussive: vertical structures in spectrogram
         percussive_mag = torch.from_numpy(
-            signal.medfilt2d(magnitude_np, kernel_size=(31, 1))  # Vertical filter
+            signal.medfilt2d(magnitude_np, kernel_size=(31, 1))
         ).to(magnitude.device)
 
-        # Reconstruct harmonic component (melodic instruments)
+        # Reconstruct harmonic component
         harmonic_stft = harmonic_mag * torch.exp(1j * phase)
-        components['harmonic'] = torch.istft(
+        harmonic_mono = torch.istft(
             harmonic_stft,
             n_fft=4096,
             hop_length=512,
             win_length=4096,
-            window=torch.hann_window(4096).to(other_stem.device)
+            window=window
         )
 
-        # Reconstruct percussive component (rhythmic elements)
+        # Reconstruct percussive component
         percussive_stft = percussive_mag * torch.exp(1j * phase)
-        components['percussive'] = torch.istft(
+        percussive_mono = torch.istft(
             percussive_stft,
             n_fft=4096,
             hop_length=512,
             win_length=4096,
-            window=torch.hann_window(4096).to(other_stem.device)
+            window=window
         )
 
-        # Residual (ambient, reverb, noise)
-        components['residual'] = other_stem.flatten() - components['harmonic'] - components['percussive']
+        # Residual
+        residual_mono = audio_to_process[
+                        :min(len(audio_to_process), len(harmonic_mono), len(percussive_mono))] - harmonic_mono[:min(
+            len(audio_to_process), len(harmonic_mono), len(percussive_mono))] - percussive_mono[
+                                                                                :min(len(audio_to_process),
+                                                                                     len(harmonic_mono),
+                                                                                     len(percussive_mono))]
 
-        # Reshape to original shape
-        for key in components:
-            if other_stem.dim() > 1:
-                components[key] = components[key][:other_stem.shape[-1]].reshape(other_stem.shape)
+        # Restore to original shape
+        def restore_shape(mono_audio, target_shape):
+            if len(target_shape) == 1:
+                return mono_audio[:target_shape[0]]
+            else:
+                # Broadcast to stereo
+                restored = mono_audio[:target_shape[1]].unsqueeze(0).expand(target_shape[0], -1)
+                return restored[:, :target_shape[1]]
+
+        components['harmonic'] = restore_shape(harmonic_mono, original_shape)
+        components['percussive'] = restore_shape(percussive_mono, original_shape)
+        components['residual'] = restore_shape(residual_mono, original_shape)
 
         # Further separate harmonic into pitched and unpitched
         components['pitched'] = self._extract_pitched_content(components['harmonic'], sr)
@@ -427,19 +477,30 @@ class EnhancedDemucsSeparator:
 
     def _remove_percussive_transients(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
         """Remove percussive transients from audio to clean up 'other' stem."""
-        # Detect transients
+        # Handle mono/stereo
+        if audio.dim() == 1:
+            audio_to_process = audio
+            original_shape = audio.shape
+        else:
+            audio_to_process = torch.mean(audio, dim=0)
+            original_shape = audio.shape
+
+        # Detect transients with proper window
+        window = torch.hann_window(2048).to(audio.device)
         stft = torch.stft(
-            audio.flatten(),
+            audio_to_process,
             n_fft=2048,
             hop_length=256,
+            win_length=2048,
+            window=window,
             return_complex=True
         )
 
         magnitude = torch.abs(stft)
 
-        # Calculate spectral flux (onset detection)
+        # Calculate spectral flux
         flux = torch.diff(magnitude, dim=1)
-        flux = torch.relu(flux)  # Keep only positive changes
+        flux = torch.relu(flux)
         flux_sum = torch.sum(flux, dim=0)
 
         # Find transient peaks
@@ -447,12 +508,12 @@ class EnhancedDemucsSeparator:
         flux_std = torch.std(flux_sum)
         transient_threshold = flux_mean + 2 * flux_std
 
-        # Create mask to suppress transients
+        # Create mask
         transient_mask = flux_sum > transient_threshold
         suppression_mask = torch.ones_like(flux_sum)
-        suppression_mask[transient_mask] = 0.3  # Suppress transients to 30%
+        suppression_mask[transient_mask] = 0.3
 
-        # Pad mask to match magnitude shape
+        # Pad mask
         suppression_mask = torch.nn.functional.pad(suppression_mask.unsqueeze(0), (1, 0))
 
         # Apply mask
@@ -461,13 +522,127 @@ class EnhancedDemucsSeparator:
         # Reconstruct
         phase = torch.angle(stft)
         stft_cleaned = magnitude_cleaned * torch.exp(1j * phase)
-        audio_cleaned = torch.istft(stft_cleaned, n_fft=2048, hop_length=256)
+        audio_cleaned_mono = torch.istft(
+            stft_cleaned,
+            n_fft=2048,
+            hop_length=256,
+            win_length=2048,
+            window=window
+        )
 
-        # Reshape to original
-        if audio.dim() > 1:
-            audio_cleaned = audio_cleaned[:audio.shape[-1]].reshape(audio.shape)
+        # Restore shape
+        if len(original_shape) == 1:
+            return audio_cleaned_mono[:original_shape[0]]
+        else:
+            restored = audio_cleaned_mono[:original_shape[1]].unsqueeze(0).expand(original_shape[0], -1)
+            return restored[:, :original_shape[1]]
 
-        return audio_cleaned
+    def _spectral_cleaning(self, audio: torch.Tensor, sr: int, stem_type: str) -> torch.Tensor:
+        """Clean spectrum based on stem type."""
+        # Handle shape properly
+        if audio.dim() == 1:
+            audio_to_process = audio
+            original_shape = audio.shape
+        else:
+            audio_to_process = torch.mean(audio, dim=0)
+            original_shape = audio.shape
+
+        # Convert to frequency domain with proper window
+        window = torch.hann_window(2048).to(audio.device)
+        stft = torch.stft(
+            audio_to_process,
+            n_fft=2048,
+            hop_length=512,
+            win_length=2048,
+            window=window,
+            return_complex=True
+        )
+
+        magnitude = torch.abs(stft)
+        phase = torch.angle(stft)
+
+        # Apply stem-specific filtering
+        if stem_type == "drums":
+            magnitude = self._enhance_transients_spectral(magnitude)
+        elif stem_type == "bass":
+            magnitude = self._enhance_bass_spectral(magnitude, sr)
+        else:  # "other"
+            magnitude = self._balanced_spectral_cleaning(magnitude)
+
+        # Reconstruct
+        stft_cleaned = magnitude * torch.exp(1j * phase)
+        audio_cleaned_mono = torch.istft(
+            stft_cleaned,
+            n_fft=2048,
+            hop_length=512,
+            win_length=2048,
+            window=window
+        )
+
+        # Restore shape
+        if len(original_shape) == 1:
+            return audio_cleaned_mono[:original_shape[0]]
+        else:
+            restored = audio_cleaned_mono[:original_shape[1]].unsqueeze(0).expand(original_shape[0], -1)
+            return restored[:, :original_shape[1]]
+
+    def _advanced_spectral_cleaning(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
+        """Advanced spectral cleaning using multiple techniques."""
+        # Handle shape properly
+        if audio.dim() == 1:
+            audio_to_process = audio
+            original_shape = audio.shape
+        else:
+            audio_to_process = torch.mean(audio, dim=0)
+            original_shape = audio.shape
+
+        # Large FFT for precise frequency work with proper window
+        window = torch.hann_window(4096).to(audio.device)
+        stft = torch.stft(
+            audio_to_process,
+            n_fft=4096,
+            hop_length=256,
+            win_length=4096,
+            window=window,
+            return_complex=True
+        )
+
+        magnitude = torch.abs(stft)
+        phase = torch.angle(stft)
+
+        # Spectral subtraction for noise reduction
+        noise_profile = torch.min(magnitude, dim=1)[0].unsqueeze(1)
+        magnitude_denoised = torch.relu(magnitude - noise_profile * 0.5)
+
+        # Wiener filtering
+        signal_power = magnitude_denoised ** 2
+        noise_power = noise_profile ** 2
+        wiener_gain = signal_power / (signal_power + noise_power + 1e-10)
+        magnitude_filtered = magnitude_denoised * wiener_gain
+
+        # Spectral smoothing
+        magnitude_np = magnitude_filtered.cpu().numpy()
+        magnitude_smooth = gaussian_filter1d(magnitude_np, sigma=2, axis=0)
+        magnitude_smooth = gaussian_filter1d(magnitude_smooth, sigma=1, axis=1)
+        magnitude_final = torch.from_numpy(magnitude_smooth).to(magnitude.device)
+
+        # Reconstruct
+        stft_cleaned = magnitude_final * torch.exp(1j * phase)
+        audio_cleaned_mono = torch.istft(
+            stft_cleaned,
+            n_fft=4096,
+            hop_length=256,
+            win_length=4096,
+            window=window
+        )
+
+        # Restore shape
+        if len(original_shape) == 1:
+            return audio_cleaned_mono[:original_shape[0]]
+        else:
+            restored = audio_cleaned_mono[:original_shape[1]].unsqueeze(0).expand(original_shape[0], -1)
+            return restored[:, :original_shape[1]]
+
 
     def _enhance_harmonics(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
         """Enhance harmonic content for better melodic instrument clarity."""
@@ -599,11 +774,16 @@ class EnhancedDemucsSeparator:
         keys = torch.zeros_like(other_stem)
         audio_np = other_stem.cpu().numpy()
 
+        # Ensure contiguous array
+        if not audio_np.flags.c_contiguous:
+            audio_np = np.ascontiguousarray(audio_np)
+
         for ch in range(audio_np.shape[0] if audio_np.ndim > 1 else 1):
             if audio_np.ndim > 1:
-                filtered = signal.sosfiltfilt(sos, audio_np[ch])
+                ch_data = np.ascontiguousarray(audio_np[ch])
+                filtered = signal.sosfiltfilt(sos, ch_data).copy()
             else:
-                filtered = signal.sosfiltfilt(sos, audio_np)
+                filtered = signal.sosfiltfilt(sos, audio_np).copy()
 
             # Detect note onsets typical of keys
             onset_env = np.abs(filtered) + np.abs(np.diff(filtered, prepend=0))
@@ -627,13 +807,18 @@ class EnhancedDemucsSeparator:
         guitar = torch.zeros_like(other_stem)
         audio_np = other_stem.cpu().numpy()
 
+        # Ensure contiguous array
+        if not audio_np.flags.c_contiguous:
+            audio_np = np.ascontiguousarray(audio_np)
+
         for ch in range(audio_np.shape[0] if audio_np.ndim > 1 else 1):
             if audio_np.ndim > 1:
-                fundamental = signal.sosfiltfilt(sos_fundamental, audio_np[ch])
-                harmonics = signal.sosfiltfilt(sos_harmonics, audio_np[ch])
+                ch_data = np.ascontiguousarray(audio_np[ch])
+                fundamental = signal.sosfiltfilt(sos_fundamental, ch_data).copy()
+                harmonics = signal.sosfiltfilt(sos_harmonics, ch_data).copy()
             else:
-                fundamental = signal.sosfiltfilt(sos_fundamental, audio_np)
-                harmonics = signal.sosfiltfilt(sos_harmonics, audio_np)
+                fundamental = signal.sosfiltfilt(sos_fundamental, audio_np).copy()
+                harmonics = signal.sosfiltfilt(sos_harmonics, audio_np).copy()
 
             # Combine with emphasis on fundamental
             combined = fundamental * 0.7 + harmonics * 0.3
@@ -773,48 +958,7 @@ class EnhancedDemucsSeparator:
 
         return stem
 
-    def _spectral_cleaning(self, audio: torch.Tensor, sr: int,
-                           stem_type: str) -> torch.Tensor:
-        """Clean spectrum based on stem type."""
-        # Convert to frequency domain
-        stft = torch.stft(
-            audio.flatten(),
-            n_fft=2048,
-            hop_length=512,
-            win_length=2048,
-            window=torch.hann_window(2048).to(audio.device),
-            return_complex=True
-        )
 
-        magnitude = torch.abs(stft)
-        phase = torch.angle(stft)
-
-        # Apply stem-specific filtering
-        if stem_type == "drums":
-            # Preserve transients, reduce sustained frequencies
-            magnitude = self._enhance_transients_spectral(magnitude)
-        elif stem_type == "bass":
-            # Focus on low frequencies
-            magnitude = self._enhance_bass_spectral(magnitude, sr)
-        else:  # "other"
-            # Balanced cleaning
-            magnitude = self._balanced_spectral_cleaning(magnitude)
-
-        # Reconstruct
-        stft_cleaned = magnitude * torch.exp(1j * phase)
-        audio_cleaned = torch.istft(
-            stft_cleaned,
-            n_fft=2048,
-            hop_length=512,
-            win_length=2048,
-            window=torch.hann_window(2048).to(audio.device)
-        )
-
-        # Reshape to original
-        if audio.dim() > 1:
-            audio_cleaned = audio_cleaned[:audio.shape[-1]].reshape(audio.shape)
-
-        return audio_cleaned
 
     def _enhance_transients_spectral(self, magnitude: torch.Tensor) -> torch.Tensor:
         """Enhance transients in spectral domain."""
@@ -853,51 +997,7 @@ class EnhancedDemucsSeparator:
 
         return torch.from_numpy(smoothed).to(magnitude.device)
 
-    def _advanced_spectral_cleaning(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
-        """Advanced spectral cleaning using multiple techniques."""
-        # Large FFT for precise frequency work
-        stft = torch.stft(
-            audio.flatten(),
-            n_fft=4096,
-            hop_length=256,
-            win_length=4096,
-            window=torch.hann_window(4096).to(audio.device),
-            return_complex=True
-        )
 
-        magnitude = torch.abs(stft)
-        phase = torch.angle(stft)
-
-        # 1. Spectral subtraction for noise reduction
-        noise_profile = torch.min(magnitude, dim=1)[0].unsqueeze(1)
-        magnitude_denoised = torch.relu(magnitude - noise_profile * 0.5)
-
-        # 2. Wiener filtering
-        signal_power = magnitude_denoised ** 2
-        noise_power = noise_profile ** 2
-        wiener_gain = signal_power / (signal_power + noise_power + 1e-10)
-        magnitude_filtered = magnitude_denoised * wiener_gain
-
-        # 3. Spectral smoothing
-        magnitude_np = magnitude_filtered.cpu().numpy()
-        magnitude_smooth = gaussian_filter1d(magnitude_np, sigma=2, axis=0)
-        magnitude_smooth = gaussian_filter1d(magnitude_smooth, sigma=1, axis=1)
-        magnitude_final = torch.from_numpy(magnitude_smooth).to(magnitude.device)
-
-        # Reconstruct
-        stft_cleaned = magnitude_final * torch.exp(1j * phase)
-        audio_cleaned = torch.istft(
-            stft_cleaned,
-            n_fft=4096,
-            hop_length=256,
-            win_length=4096,
-            window=torch.hann_window(4096).to(audio.device)
-        )
-
-        if audio.dim() > 1:
-            audio_cleaned = audio_cleaned[:audio.shape[-1]].reshape(audio.shape)
-
-        return audio_cleaned
 
     def _dynamic_eq(self, audio: torch.Tensor, sr: int, stem_type: str) -> torch.Tensor:
         """Apply dynamic EQ based on stem type."""
@@ -942,6 +1042,11 @@ class EnhancedDemucsSeparator:
         band_limits = [(0, 200), (200, 800), (800, 3000), (3000, sr // 2)]
 
         audio_np = audio.cpu().numpy()
+
+        # Ensure contiguous array
+        if not audio_np.flags.c_contiguous:
+            audio_np = np.ascontiguousarray(audio_np)
+
         compressed_bands = []
 
         for low, high in band_limits:
@@ -953,7 +1058,8 @@ class EnhancedDemucsSeparator:
             else:
                 sos = signal.butter(4, [low, high], 'bandpass', fs=sr, output='sos')
 
-            band = signal.sosfiltfilt(sos, audio_np.flatten())
+            band_data = np.ascontiguousarray(audio_np.flatten())
+            band = signal.sosfiltfilt(sos, band_data).copy()
 
             # Simple compression
             threshold = np.percentile(np.abs(band), 85)
@@ -976,6 +1082,7 @@ class EnhancedDemucsSeparator:
             audio_compressed = audio_compressed.reshape(audio.shape)
 
         return audio_compressed
+
 
     def _adaptive_gate(self, audio: torch.Tensor, threshold_db: float = -50) -> torch.Tensor:
         """Apply adaptive noise gate."""
