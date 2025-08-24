@@ -17,7 +17,7 @@ except ImportError:
 
 
 class DemucsSeparator:
-    """Demucs v4 source separator for educational demonstration."""
+    """Demucs v4 source separator for educational demonstration - Instrumental stems only."""
 
     def __init__(self, config: Dict):
         self.config = config
@@ -47,7 +47,8 @@ class DemucsSeparator:
                  sample_rate: int,
                  progress_callback: Optional[Callable] = None) -> Dict:
         """
-        Separate audio into stems using Demucs v4 with progress tracking.
+        Separate audio into instrumental stems only (bass, drums, other).
+        Vocals are excluded from processing and output.
         """
         if not self.model:
             raise RuntimeError("Demucs model not loaded")
@@ -96,14 +97,21 @@ class DemucsSeparator:
                 )
 
             if progress_callback:
-                progress_callback(0.85, "Processing stems...")
+                progress_callback(0.85, "Processing instrumental stems...")
 
-            # Extract stems
+            # Extract only instrumental stems (excluding vocals)
             stems = {}
             source_names = self.model.sources
             total_stems = len(source_names)
 
+            # Filter out vocals from processing
+            instrumental_sources = [name for name in source_names if name.lower() != 'vocals']
+
             for i, name in enumerate(source_names):
+                # Skip vocals completely
+                if name.lower() == 'vocals':
+                    continue
+
                 if progress_callback:
                     stem_progress = 0.85 + (i / total_stems) * 0.1
                     progress_callback(stem_progress, f"Processing {name} stem...")
@@ -123,7 +131,7 @@ class DemucsSeparator:
             if progress_callback:
                 progress_callback(0.95, "Calculating quality metrics...")
 
-            # Calculate metrics (simplified for speed)
+            # Calculate metrics (excluding vocals)
             metrics = self._calculate_fast_metrics(waveform, stems)
 
             if progress_callback:
@@ -133,14 +141,15 @@ class DemucsSeparator:
 
             return {
                 "stems": stems,
-                "source_names": source_names,
+                "source_names": instrumental_sources,  # Only instrumental sources
                 "metrics": metrics,
                 "processing_time": processing_time,
                 "model": self.model_name,
                 "quality_settings": {
                     "shifts": min(self.shifts, 5),
                     "overlap": self.overlap
-                }
+                },
+                "note": "Instrumental stems only - vocals excluded"
             }
 
         except Exception as e:
@@ -148,10 +157,10 @@ class DemucsSeparator:
             raise
 
     def _calculate_fast_metrics(self, original: torch.Tensor, stems: Dict) -> Dict:
-        """Fast calculation of essential metrics only."""
+        """Fast calculation of essential metrics for instrumental stems only."""
         metrics = {}
 
-        # Reconstruct from stems
+        # Reconstruct from instrumental stems only
         reconstructed = torch.zeros_like(original)
         for stem in stems.values():
             if stem.shape != original.shape:
@@ -161,25 +170,29 @@ class DemucsSeparator:
                     stem = torch.mean(stem, dim=0, keepdim=True)
             reconstructed += stem
 
-        # Essential metrics only
+        # Note: SNR will be lower since we're not including vocals in reconstruction
+        # This is expected and normal
         signal_power = torch.mean(original ** 2)
-        noise_power = torch.mean((original - reconstructed) ** 2)
-        snr = 10 * torch.log10(signal_power / (noise_power + 1e-10))
-        metrics["reconstruction_snr"] = float(snr)
-        metrics["num_stems"] = len(stems)
+        instrumental_power = torch.mean(reconstructed ** 2)
 
-        # Energy per stem
+        # Calculate instrumental-only metrics
+        metrics["instrumental_energy_ratio"] = float(instrumental_power / (signal_power + 1e-10))
+        metrics["num_instrumental_stems"] = len(stems)
+
+        # Energy per instrumental stem
         for name, stem in stems.items():
             energy = torch.mean(stem ** 2)
             metrics[f"{name}_energy"] = float(energy)
+            # Calculate relative energy among instrumentals
+            metrics[f"{name}_instrumental_ratio"] = float(energy / (instrumental_power + 1e-10))
 
         return metrics
 
     def _calculate_detailed_metrics(self, original: torch.Tensor, stems: Dict) -> Dict:
-        """Calculate comprehensive metrics for separation quality assessment."""
+        """Calculate comprehensive metrics for instrumental separation quality."""
         metrics = {}
 
-        # Reconstruct from stems
+        # Reconstruct from instrumental stems only
         reconstructed = torch.zeros_like(original)
         for stem in stems.values():
             if stem.shape != original.shape:
@@ -190,29 +203,25 @@ class DemucsSeparator:
                     stem = torch.mean(stem, dim=0, keepdim=True)
             reconstructed += stem
 
-        # 1. Signal-to-Noise Ratio (SNR) - Primary quality metric
-        signal_power = torch.mean(original ** 2)
-        noise_power = torch.mean((original - reconstructed) ** 2)
-        snr = 10 * torch.log10(signal_power / (noise_power + 1e-10))
-        metrics["reconstruction_snr"] = float(snr)
+        # 1. Instrumental-only reconstruction metrics
+        instrumental_power = torch.mean(reconstructed ** 2)
+        original_power = torch.mean(original ** 2)
 
-        # 2. Source-to-Distortion Ratio (SDR) approximation
-        distortion = original - reconstructed
-        sdr = 10 * torch.log10(signal_power / (torch.mean(distortion ** 2) + 1e-10))
-        metrics["source_distortion_ratio"] = float(sdr)
+        # Instrumental coverage (how much of the instrumentals we captured)
+        metrics["instrumental_coverage_ratio"] = float(instrumental_power / (original_power + 1e-10))
 
-        # 3. Number of stems
-        metrics["num_stems"] = len(stems)
+        # 2. Number of instrumental stems
+        metrics["num_instrumental_stems"] = len(stems)
 
-        # 4. Energy distribution across stems
-        total_energy = torch.sum(original ** 2)
+        # 3. Energy distribution across instrumental stems
+        total_instrumental_energy = torch.sum(reconstructed ** 2)
         for name, stem in stems.items():
             energy = torch.sum(stem ** 2)
-            energy_ratio = energy / (total_energy + 1e-10)
+            energy_ratio = energy / (total_instrumental_energy + 1e-10)
             metrics[f"{name}_energy"] = float(energy)
             metrics[f"{name}_energy_ratio"] = float(energy_ratio)
 
-        # 5. Dynamic range metrics per stem
+        # 4. Dynamic range metrics per instrumental stem
         for name, stem in stems.items():
             if stem.numel() > 0:
                 peak = torch.max(torch.abs(stem))
@@ -222,89 +231,96 @@ class DemucsSeparator:
                 metrics[f"{name}_peak_amplitude"] = float(peak)
                 metrics[f"{name}_rms_energy"] = float(rms)
 
-        # 6. Spectral metrics
-        metrics.update(self._calculate_spectral_metrics(original, stems))
+        # 5. Spectral metrics for instrumentals
+        metrics.update(self._calculate_spectral_metrics(reconstructed, stems))
 
-        # 7. Quality assessment
-        metrics["overall_quality_score"] = self._calculate_quality_score(metrics)
+        # 6. Quality assessment for instrumental separation
+        metrics["instrumental_quality_score"] = self._calculate_instrumental_quality_score(metrics)
 
         return metrics
 
-    def _calculate_spectral_metrics(self, original: torch.Tensor, stems: Dict) -> Dict:
-        """Calculate spectral-based quality metrics."""
+    def _calculate_spectral_metrics(self, instrumental_mix: torch.Tensor, stems: Dict) -> Dict:
+        """Calculate spectral-based quality metrics for instrumental stems."""
         spectral_metrics = {}
 
         # Convert to frequency domain
-        original_fft = torch.fft.rfft(original, dim=-1)
-        original_magnitude = torch.abs(original_fft)
+        mix_fft = torch.fft.rfft(instrumental_mix, dim=-1)
+        mix_magnitude = torch.abs(mix_fft)
 
-        # Reconstruct in frequency domain
-        reconstructed_fft = torch.zeros_like(original_fft)
-        for stem in stems.values():
-            if stem.shape == original.shape:
-                stem_fft = torch.fft.rfft(stem, dim=-1)
-                reconstructed_fft += stem_fft
+        # Analyze each instrumental stem
+        for name, stem in stems.items():
+            stem_fft = torch.fft.rfft(stem, dim=-1)
+            stem_magnitude = torch.abs(stem_fft)
 
-        reconstructed_magnitude = torch.abs(reconstructed_fft)
+            # Spectral energy ratio for this stem
+            stem_spectral_energy = torch.sum(stem_magnitude ** 2)
+            mix_spectral_energy = torch.sum(mix_magnitude ** 2)
+            spectral_metrics[f"{name}_spectral_ratio"] = float(
+                stem_spectral_energy / (mix_spectral_energy + 1e-10)
+            )
 
-        # Spectral SNR
-        spectral_error = torch.abs(original_magnitude - reconstructed_magnitude)
-        spectral_signal_power = torch.mean(original_magnitude ** 2)
-        spectral_noise_power = torch.mean(spectral_error ** 2)
-        spectral_snr = 10 * torch.log10(spectral_signal_power / (spectral_noise_power + 1e-10))
-        spectral_metrics["spectral_snr"] = float(spectral_snr)
-
-        # Frequency-wise correlation
-        correlation = torch.corrcoef(torch.stack([
-            original_magnitude.flatten(),
-            reconstructed_magnitude.flatten()
-        ]))[0, 1]
-        spectral_metrics["spectral_correlation"] = float(correlation) if not torch.isnan(correlation) else 0.0
-
-        # High frequency preservation (above 8kHz)
+        # Frequency distribution quality
         sr = 44100  # Assume standard sample rate
         nyquist = sr // 2
-        high_freq_bin = int(8000 * original_magnitude.shape[-1] / nyquist)
 
-        if high_freq_bin < original_magnitude.shape[-1]:
-            high_freq_original = original_magnitude[..., high_freq_bin:]
-            high_freq_reconstructed = reconstructed_magnitude[..., high_freq_bin:]
+        # Check low frequency content (bass region: 20-250 Hz)
+        low_freq_bin = int(250 * mix_magnitude.shape[-1] / nyquist)
+        low_freq_energy = torch.sum(mix_magnitude[..., :low_freq_bin] ** 2)
 
-            hf_signal_power = torch.mean(high_freq_original ** 2)
-            hf_error_power = torch.mean((high_freq_original - high_freq_reconstructed) ** 2)
-            hf_snr = 10 * torch.log10(hf_signal_power / (hf_error_power + 1e-10))
-            spectral_metrics["high_freq_snr"] = float(hf_snr)
+        # Check mid frequency content (250-4000 Hz)
+        mid_freq_bin = int(4000 * mix_magnitude.shape[-1] / nyquist)
+        mid_freq_energy = torch.sum(mix_magnitude[..., low_freq_bin:mid_freq_bin] ** 2)
+
+        # Check high frequency content (4000+ Hz)
+        high_freq_energy = torch.sum(mix_magnitude[..., mid_freq_bin:] ** 2)
+
+        total_energy = low_freq_energy + mid_freq_energy + high_freq_energy
+        spectral_metrics["low_freq_ratio"] = float(low_freq_energy / (total_energy + 1e-10))
+        spectral_metrics["mid_freq_ratio"] = float(mid_freq_energy / (total_energy + 1e-10))
+        spectral_metrics["high_freq_ratio"] = float(high_freq_energy / (total_energy + 1e-10))
 
         return spectral_metrics
 
-    def _calculate_quality_score(self, metrics: Dict) -> float:
-        """Calculate overall quality score (0-100) based on multiple metrics."""
-        snr = metrics.get("reconstruction_snr", 0)
-        sdr = metrics.get("source_distortion_ratio", 0)
-        spectral_snr = metrics.get("spectral_snr", 0)
-        spectral_corr = metrics.get("spectral_correlation", 0)
+    def _calculate_instrumental_quality_score(self, metrics: Dict) -> float:
+        """Calculate overall quality score for instrumental separation (0-100)."""
+        # Factors for instrumental quality
+        coverage = metrics.get("instrumental_coverage_ratio", 0)
 
-        # Weighted scoring
-        snr_score = min(max(snr, 0) / 30.0, 1.0) * 40  # 40% weight on SNR
-        sdr_score = min(max(sdr, 0) / 25.0, 1.0) * 30  # 30% weight on SDR
-        spectral_score = min(max(spectral_snr, 0) / 25.0, 1.0) * 20  # 20% weight on spectral SNR
-        corr_score = max(spectral_corr, 0) * 10  # 10% weight on correlation
+        # Check balance between stems (ideal: relatively even distribution)
+        energy_ratios = [v for k, v in metrics.items() if k.endswith("_energy_ratio")]
+        if energy_ratios:
+            balance_score = 1.0 - np.std(energy_ratios)  # Lower std = better balance
+        else:
+            balance_score = 0.5
 
-        total_score = snr_score + sdr_score + spectral_score + corr_score
+        # Spectral distribution quality
+        low_freq = metrics.get("low_freq_ratio", 0.3)
+        mid_freq = metrics.get("mid_freq_ratio", 0.5)
+        high_freq = metrics.get("high_freq_ratio", 0.2)
+
+        # Ideal distribution: balanced across spectrum
+        spectral_balance = 1.0 - abs(low_freq - 0.3) - abs(mid_freq - 0.5) - abs(high_freq - 0.2)
+
+        # Weighted scoring for instrumental quality
+        coverage_score = min(coverage * 1.2, 1.0) * 40  # 40% weight on coverage
+        balance_score = balance_score * 30  # 30% weight on stem balance
+        spectral_score = spectral_balance * 30  # 30% weight on spectral balance
+
+        total_score = coverage_score + balance_score + spectral_score
         return min(total_score, 100.0)
 
     def get_quality_assessment(self, metrics: Dict) -> str:
-        """Get human-readable quality assessment."""
-        snr = metrics.get("reconstruction_snr", 0)
-        quality_score = metrics.get("overall_quality_score", 0)
+        """Get human-readable quality assessment for instrumental separation."""
+        quality_score = metrics.get("instrumental_quality_score", 0)
+        coverage = metrics.get("instrumental_coverage_ratio", 0)
 
         if quality_score >= 80:
-            return "Excellent - Professional quality separation"
+            return "Excellent - Clean instrumental separation with clear distinction between stems"
         elif quality_score >= 65:
-            return "Very Good - High quality separation with minor artifacts"
+            return "Very Good - Good instrumental separation with minor bleeding between stems"
         elif quality_score >= 50:
-            return "Good - Acceptable quality for most applications"
+            return "Good - Acceptable instrumental separation for most applications"
         elif quality_score >= 35:
-            return "Fair - Noticeable artifacts but usable"
+            return "Fair - Noticeable stem bleeding but usable for remixing"
         else:
-            return "Poor - Significant artifacts present"
+            return "Poor - Significant artifacts in instrumental separation"

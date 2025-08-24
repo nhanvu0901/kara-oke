@@ -82,4 +82,5 @@ ehthumbs_vista.db
 *.tmp
 *.log
 /output
-/song
+/son
+.env
