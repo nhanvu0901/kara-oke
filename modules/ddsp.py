@@ -12,12 +12,10 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from ddsp_pytorch import ddsp
+
 # DDSP imports
 try:
-    from ddsp_pytorch import ddsp
-    from ddsp.core import mlp, gru, split_to_dict
-    from ddsp.core import extract_loudness, extract_pitch
+    from ddsp_pytorch.ddsp import mlp, gru, extract_loudness, extract_pitch
     DDSP_AVAILABLE = True
 except ImportError:
     DDSP_AVAILABLE = False
@@ -44,14 +42,21 @@ class DDSPEnhancer:
         ))
 
         if not DDSP_AVAILABLE:
-            raise RuntimeError("DDSP not installed. Run: pip install ddsp==3.4.4")
+            raise RuntimeError("DDSP not installed. Run: pip install ddsp_pytorch")
 
-        # Load pre-trained model (simplified approach)
+        # Load pre-trained model
         console.print(f"Loading DDSP {model_type} model...")
 
-        # For simplicity, we'll use a basic autoencoder setup
-        # In production, you'd load actual pre-trained weights
-        self.model_type = model_type
+        # Assuming user has downloaded the pretrained .ts file from:
+        # Violin: https://nubo.ircam.fr/index.php/s/f6XB4Kp9onxiNwZ/download
+        # Rename it to ddsp_pretrained_violin.ts or adjust the path below
+        model_path = f"ddsp_pretrained_{model_type}.ts"
+        if not Path(model_path).exists():
+            raise FileNotFoundError(f"Pretrained model file not found: {model_path}. Download from IRCAM repository.")
+
+        self.model = torch.jit.load(model_path)
+        self.model.eval()
+        self.model.to(self.device)
 
         console.print(f"[green]✓[/green] Model ready! Sample rate: {self.sample_rate} Hz\n")
 
@@ -73,7 +78,7 @@ class DDSPEnhancer:
         console.print("[green]✓[/green] Settings applied\n")
 
     def extract_features(self, audio):
-        """Extract F0 (pitch) and loudness from audio."""
+        """Extract F0 (pitch) and loudness from audio using DDSP tools."""
         console.print("Extracting audio features...")
 
         # Convert to numpy for processing
@@ -82,30 +87,12 @@ class DDSPEnhancer:
         else:
             audio_np = audio
 
-        # Simple feature extraction (placeholder for actual DDSP feature extraction)
-        # In real implementation, use DDSP's feature extraction
+        # Use DDSP's extract_pitch and extract_loudness
+        # Assuming these functions take numpy array and sample_rate, return arrays of shape (frames,)
+        f0 = extract_pitch(audio_np, self.sample_rate)
+        loudness = extract_loudness(audio_np, self.sample_rate)
 
-        # Estimate fundamental frequency (simplified)
-        import scipy.signal
-
-        # Calculate loudness (RMS energy in dB)
-        frame_size = 2048
-        hop_size = 512
-
-        frames = []
-        for i in range(0, len(audio_np) - frame_size, hop_size):
-            frame = audio_np[i:i + frame_size]
-            rms = np.sqrt(np.mean(frame ** 2))
-            db = 20 * np.log10(rms + 1e-10)
-            frames.append(db)
-
-        loudness = np.array(frames)
-
-        # Placeholder for F0 (in real implementation, use CREPE or similar)
-        # For now, create a simple placeholder
-        f0 = np.ones_like(loudness) * 440.0  # A4 note as placeholder
-
-        console.print(f"[green]✓[/green] Features extracted: {len(loudness)} frames\n")
+        console.print(f"[green]✓[/green] Features extracted: {len(f0)} frames\n")
 
         return {
             'f0': f0,
@@ -114,39 +101,23 @@ class DDSPEnhancer:
         }
 
     def enhance_audio(self, features):
-        """Apply DDSP enhancement to audio features."""
+        """Apply DDSP timbre transfer to audio features."""
         console.print("Applying DDSP enhancement...")
 
-        # Simple enhancement by modifying features
-        enhanced_features = features.copy()
+        f0 = features['f0']
+        loudness = features['loudness']
+        original_audio = features['audio']
 
-        # Enhance loudness dynamics
-        loudness = enhanced_features['loudness']
+        # Convert to tensors: (1, frames, 1)
+        f0_tensor = torch.from_numpy(f0).float().to(self.device).unsqueeze(0).unsqueeze(-1)
+        loudness_tensor = torch.from_numpy(loudness).float().to(self.device).unsqueeze(0).unsqueeze(-1)
 
-        # Normalize and enhance dynamic range
-        loudness_norm = (loudness - np.mean(loudness)) / (np.std(loudness) + 1e-8)
-        loudness_enhanced = loudness_norm * (1 + self.enhancement_level * 0.5)
-        loudness_enhanced = loudness_enhanced * np.std(loudness) + np.mean(loudness)
+        # Synthesize with DDSP model
+        with torch.no_grad():
+            synth_audio = self.model(f0_tensor, loudness_tensor).squeeze(0).cpu().numpy()
 
-        enhanced_features['loudness'] = loudness_enhanced
-
-        # In real implementation, this would use the DDSP synthesizer
-        # For now, apply simple spectral enhancement
-        audio = features['audio']
-
-        # Apply gentle high-frequency boost (simplified)
-        from scipy import signal
-
-        # Design a high-shelf filter
-        nyquist = self.sample_rate / 2
-        cutoff = 4000  # Hz
-
-        # Create filter
-        sos = signal.butter(2, cutoff / nyquist, btype='high', output='sos')
-        high_freq = signal.sosfilt(sos, audio)
-
-        # Mix enhanced high frequencies with original
-        enhanced_audio = audio + (high_freq * self.enhancement_level * 0.3)
+        # Mix with original based on enhancement_level (0: original, 1: full transfer)
+        enhanced_audio = (1 - self.enhancement_level) * original_audio + self.enhancement_level * synth_audio
 
         # Normalize to prevent clipping
         max_val = np.max(np.abs(enhanced_audio))
@@ -226,10 +197,10 @@ def main():
     ))
 
     # === CONFIGURATION - CHANGE THESE VALUES ===
-    INPUT_FILE = "/Users/nhanvu/Documents/ AI project/karaoke_auto_pipeline/output/instrumentals/eng_piano.wav"
+    INPUT_FILE = "/Users/nhanvu/Documents/AI project/karaoke_auto_pipeline/output/instrumentals/eng_piano.wav"
     OUTPUT_FILE = "enhanced_piano_ddsp.wav"
     ENHANCEMENT_LEVEL = 0.8  # 0.0 = no change, 1.0 = maximum enhancement
-    MODEL_TYPE = "violin"  # Options: violin, flute, trumpet (simplified for demo)
+    MODEL_TYPE = "violin"  # Options: violin, saxophone (download pretrained .ts files from IRCAM)
     # ==========================================
 
     try:
