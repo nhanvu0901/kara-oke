@@ -53,8 +53,14 @@ class SeparationPipeline:
             self.audio_loader = AudioLoader(self.config)
             progress.update(task2, advance=100)
 
-            task3 = progress.add_task("Loading Demucs v4...", total=100)
-            self.separator = DemucsSeparator(self.config)
+            separator_engine = self.config.get("separator_engine", "uvr5")
+            if separator_engine == "uvr5":
+                task3 = progress.add_task("Loading UVR5 MDX-Net...", total=100)
+                from .uvr5_separator import UVR5Separator
+                self.separator = UVR5Separator(self.config)
+            elif separator_engine == "demucs":
+                task3 = progress.add_task("Loading Demucs v4...", total=100)
+                self.separator = DemucsSeparator(self.config)
             progress.update(task3, advance=100)
 
             task4 = progress.add_task("Preparing analyzer...", total=100)

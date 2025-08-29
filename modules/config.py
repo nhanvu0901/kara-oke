@@ -32,25 +32,20 @@ def create_default_config() -> Dict[str, Any]:
             "model": "deepseek-chat",
             "temperature": 0.7,
             "max_tokens": 2048,
+        },
+        "uvr5": {
+            "model": "UVR-MDX-NET-Inst_HQ_3",
+            "chunk_size": 524288,  # Larger for better quality
+            "overlap": 0.75,  # Higher overlap for smoother results
+            "margin": 88200,  # 2 seconds margin
+            "denoise": True,
+            "post_process": True,
+            "tta": True,  # Test-time augmentation for quality
         }
     }
 
 
-def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
-    """Load configuration from file or create default."""
-    if config_path and config_path.exists():
-        try:
-            with open(config_path, 'r') as f:
-                file_config = json.load(f)
 
-            # Merge with defaults
-            config = create_default_config()
-            config.update(file_config)
-            return config
-        except Exception as e:
-            print(f"Warning: Failed to load config from {config_path}: {e}")
-
-    return create_default_config()
 
 
 def save_config(config: Dict[str, Any], config_path: Path):

@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from modules.pipeline import SeparationPipeline
-from modules.config import load_config, create_default_config
+from modules.config import  create_default_config
 
 console = Console()
 
@@ -38,6 +38,9 @@ def main():
     parser.add_argument("--fast", action="store_true", help="Fast processing")
     parser.add_argument("--high-quality", action="store_true", help="High quality processing")
 
+    parser.add_argument("--separator", default="uvr5",
+                        choices=["uvr5", "demucs", "hybrid"],
+                        help="Separation engine")
     # Features
     parser.add_argument("--interactive", action="store_true", help="Interactive learning mode")
     parser.add_argument("--no-viz", action="store_true", help="Disable visualizations")
@@ -64,11 +67,7 @@ def main():
     config.update({
         "output_dir": args.output,
         "visualization": not args.no_viz,
-        "demucs": {
-            "model": args.model,
-            "shifts": 3 if args.fast else 10 if args.high_quality else args.shifts,
-            "overlap": args.overlap
-        }
+        "separator_engine": args.separator,
     })
 
     # Initialize and run pipeline
