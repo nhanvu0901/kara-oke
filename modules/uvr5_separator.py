@@ -266,191 +266,160 @@ class UVR5Separator:
             return audio
 
     def _process_chunks_with_model(self, audio_np: np.ndarray, model) -> np.ndarray:
-        """Process audio in chunks through ONNX model with correct dimensions."""
+        """Process audio through ONNX model using torch for STFT operations."""
 
         # Get model input shape expectations
         input_info = model.get_inputs()[0]
-        expected_shape = input_info.shape  # Should be like [1, 4, 2048/3072, 256]
+        expected_shape = input_info.shape
 
         logger.info(f"Model expects shape: {expected_shape}")
 
         # MDX-Net specific parameters
         if expected_shape[2] == 2048:
-            n_fft = 4096  # Results in 2049 bins, we'll use 2048
+            n_fft = 4096
         elif expected_shape[2] == 3072:
-            n_fft = 6144  # Results in 3073 bins, we'll use 3072
+            n_fft = 6144
         else:
-            n_fft = 4096  # Default
+            n_fft = 4096
 
         hop_length = 1024
 
-        expected_channels = expected_shape[1]  # 4 channels
-        expected_freq_bins = expected_shape[2]  # 2048 or 3072
-        expected_time_frames = expected_shape[3]  # 256 frames
+        expected_channels = expected_shape[1]
+        expected_freq_bins = expected_shape[2]
+        expected_time_frames = expected_shape[3]
 
-        # Process in fixed-size chunks
-        chunk_samples = expected_time_frames * hop_length  # Number of samples per chunk
+        # Convert to torch tensor for STFT operations
+        audio_tensor = torch.from_numpy(audio_np).float()
 
-        # Pad audio for processing
-        pad_size = n_fft // 2
-        audio_padded = np.pad(audio_np, ((0, 0), (pad_size, pad_size)), mode='reflect')
+        # Ensure stereo
+        if audio_tensor.shape[0] == 1:
+            audio_tensor = audio_tensor.repeat(2, 1)
+        elif audio_tensor.shape[0] > 2:
+            audio_tensor = audio_tensor[:2]
 
-        # Ensure we have 2 channels
-        if audio_padded.shape[0] == 1:
-            audio_padded = np.repeat(audio_padded, 2, axis=0)
-        elif audio_padded.shape[0] > 2:
-            audio_padded = audio_padded[:2]
+        # Process entire audio at once
+        window = torch.hann_window(n_fft)
 
-        total_length = audio_padded.shape[1]
-        output = np.zeros_like(audio_padded)
+        # Compute STFT using torch
+        stft_complex = torch.stft(
+            audio_tensor,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window,
+            center=True,
+            return_complex=True
+        )
 
-        # Create window with CORRECT size matching n_fft
-        window = np.hanning(n_fft)  # This ensures window.shape[0] == n_fft
+        magnitude = torch.abs(stft_complex)
+        phase = torch.angle(stft_complex)
 
-        # Process in chunks
-        for start_idx in range(0, total_length - chunk_samples, chunk_samples // 2):
-            end_idx = start_idx + chunk_samples
-            chunk = audio_padded[:, start_idx:end_idx]
+        # CRITICAL FIX: Trim magnitude to expected frequency bins
+        # STFT produces n_fft//2 + 1 bins, but model expects exactly expected_freq_bins
+        if magnitude.shape[1] > expected_freq_bins:
+            magnitude = magnitude[:, :expected_freq_bins, :]
+            phase = phase[:, :expected_freq_bins, :]
 
-            if chunk.shape[1] < chunk_samples:
-                # Pad last chunk
-                chunk = np.pad(chunk, ((0, 0), (0, chunk_samples - chunk.shape[1])), mode='constant')
+        # Process in chunks for model inference
+        n_frames = magnitude.shape[-1]
+        output_magnitude = torch.zeros_like(magnitude)
 
-            # Compute STFT with properly sized window
-            stft_result = []
+        for start_frame in range(0, n_frames, expected_time_frames // 2):
+            end_frame = min(start_frame + expected_time_frames, n_frames)
 
-            for channel in chunk:
-                # Use scipy's stft with explicit parameters
-                f, t, Zxx = signal.stft(
-                    channel,
-                    fs=44100,
-                    window=('hann', n_fft),  # Use tuple format to ensure correct size
-                    nperseg=n_fft,  # Must match window size
-                    noverlap=n_fft - hop_length,
-                    boundary=None,
-                    padded=False
-                )
-                stft_result.append(Zxx)
+            # Extract chunk
+            mag_chunk = magnitude[:, :, start_frame:end_frame]
 
-            stft_np = np.stack(stft_result)  # Shape: [2, freq_bins, time_frames]
+            # Pad time frames if needed
+            actual_frames = mag_chunk.shape[2]
+            if mag_chunk.shape[2] < expected_time_frames:
+                pad = expected_time_frames - mag_chunk.shape[2]
+                mag_chunk = torch.nn.functional.pad(mag_chunk, (0, pad, 0, 0))
 
-            # Trim frequency bins to match expected
-            if stft_np.shape[1] > expected_freq_bins:
-                stft_np = stft_np[:, :expected_freq_bins, :]
-
-            # Trim or pad time frames to match expected
-            if stft_np.shape[2] > expected_time_frames:
-                stft_np = stft_np[:, :, :expected_time_frames]
-            elif stft_np.shape[2] < expected_time_frames:
-                pad_frames = expected_time_frames - stft_np.shape[2]
-                stft_np = np.pad(stft_np, ((0, 0), (0, 0), (0, pad_frames)), mode='constant')
-
-            magnitude = np.abs(stft_np)
-            phase = np.angle(stft_np)
-
-            # Convert to 4 channels as expected by model
+            # Convert to 4 channels if needed
             if expected_channels == 4:
-                # Duplicate stereo to 4 channels (L, R, L, R)
-                mag_4ch = np.zeros((4, expected_freq_bins, expected_time_frames), dtype=np.float32)
-                mag_4ch[0] = magnitude[0]  # Left
-                mag_4ch[1] = magnitude[1]  # Right
-                mag_4ch[2] = magnitude[0]  # Left copy
-                mag_4ch[3] = magnitude[1]  # Right copy
+                mag_4ch = torch.zeros((4, expected_freq_bins, expected_time_frames))
+                mag_4ch[0] = mag_chunk[0]
+                mag_4ch[1] = mag_chunk[1]
+                mag_4ch[2] = mag_chunk[0]
+                mag_4ch[3] = mag_chunk[1]
+                mag_input_np = mag_4ch.unsqueeze(0).numpy().astype(np.float32)
             else:
-                mag_4ch = magnitude.astype(np.float32)
+                mag_input_np = mag_chunk.unsqueeze(0).numpy().astype(np.float32)
 
-            # Add batch dimension
-            mag_input = np.expand_dims(mag_4ch, axis=0).astype(np.float32)
-
-            # Run inference
+            # Run model inference
             try:
                 input_name = model.get_inputs()[0].name
                 output_name = model.get_outputs()[0].name
 
-                # Run model
-                pred_output = model.run([output_name], {input_name: mag_input})[0]
-
-                # Process output
+                pred_output = model.run([output_name], {input_name: mag_input_np})[0]
                 pred_output = np.squeeze(pred_output)
 
-                # If output has 4 channels, average to stereo
+                # Convert back to 2 channels if needed
                 if pred_output.ndim == 3 and pred_output.shape[0] == 4:
-                    pred_stereo = np.zeros((2, pred_output.shape[1], pred_output.shape[2]))
-                    pred_stereo[0] = (pred_output[0] + pred_output[2]) / 2
-                    pred_stereo[1] = (pred_output[1] + pred_output[3]) / 2
-                    pred_output = pred_stereo
-                elif pred_output.ndim == 2:
-                    # If output is 2D, expand to match magnitude shape
-                    if magnitude.shape[0] == 2:
-                        pred_output = np.stack([pred_output, pred_output])
+                    pred_output = (pred_output[0:2] + pred_output[2:4]) / 2
+
+                # Convert to torch
+                pred_torch = torch.from_numpy(pred_output).float()
+
+                # Ensure correct shape
+                if pred_torch.shape[0] != 2:
+                    if pred_torch.ndim == 2:
+                        pred_torch = pred_torch.unsqueeze(0).repeat(2, 1, 1)
+
+                # CRITICAL FIX: Ensure dimensions match exactly
+                # Trim to actual frame count and frequency bins
+                pred_torch = pred_torch[:2, :expected_freq_bins, :actual_frames]
+                mag_chunk_orig = magnitude[:, :expected_freq_bins, start_frame:start_frame + actual_frames]
 
                 # Apply as mask
-                if pred_output.shape == magnitude.shape:
-                    mask = pred_output / (magnitude + 1e-7)
-                else:
-                    # Fallback if shapes don't match
-                    mask = np.ones_like(magnitude)
+                mask = torch.clamp(pred_torch / (mag_chunk_orig + 1e-7), 0, 1)
 
-                mask = np.clip(mask, 0, 1)
-
-                masked_magnitude = magnitude * mask
-                masked_stft = masked_magnitude * np.exp(1j * phase)
-
-                # iSTFT for this chunk with matching window
-                chunk_output = []
-                for channel_stft in masked_stft:
-                    _, reconstructed = signal.istft(
-                        channel_stft,
-                        fs=44100,
-                        window=('hann', n_fft),  # Use same window format
-                        nperseg=n_fft,
-                        noverlap=n_fft - hop_length,
-                        boundary=False
-                    )
-                    # Ensure we don't exceed chunk size
-                    if len(reconstructed) > chunk_samples:
-                        reconstructed = reconstructed[:chunk_samples]
-                    chunk_output.append(reconstructed)
-
-                chunk_output = np.stack(chunk_output)
-
-                # Blend chunk into output with crossfade
-                actual_samples = min(chunk_output.shape[1], end_idx - start_idx)
-
-                if start_idx == 0:
-                    output[:, start_idx:start_idx + actual_samples] = chunk_output[:, :actual_samples]
-                else:
-                    # Crossfade overlap region
-                    overlap_size = min(chunk_samples // 4, actual_samples)
-                    fade_in = np.linspace(0, 1, overlap_size)
-                    fade_out = 1 - fade_in
-
-                    output[:, start_idx:start_idx + overlap_size] *= fade_out
-                    output[:, start_idx:start_idx + overlap_size] += chunk_output[:, :overlap_size] * fade_in
-
-                    if actual_samples > overlap_size:
-                        output[:, start_idx + overlap_size:start_idx + actual_samples] = chunk_output[:,
-                                                                                         overlap_size:actual_samples]
+                # Apply mask to the output
+                output_magnitude[:, :expected_freq_bins, start_frame:start_frame + actual_frames] = (
+                        mag_chunk_orig * mask
+                )
 
             except Exception as e:
-                logger.error(f"Chunk processing failed: {e}")
-                # Use input as fallback for this chunk
-                actual_chunk_size = min(end_idx - start_idx, chunk.shape[1])
-                output[:, start_idx:start_idx + actual_chunk_size] = chunk[:, :actual_chunk_size]
+                logger.error(f"Model inference failed: {e}")
+                # Copy original on failure
+                output_magnitude[:, :, start_frame:end_frame] = magnitude[:, :, start_frame:end_frame]
 
-        # Remove padding
-        if pad_size > 0:
-            output = output[:, pad_size:-pad_size]
+        # Reconstruct with iSTFT
+        # Need to pad back if we trimmed frequency bins
+        if output_magnitude.shape[1] < (n_fft // 2 + 1):
+            pad_bins = (n_fft // 2 + 1) - output_magnitude.shape[1]
+            output_magnitude = torch.nn.functional.pad(output_magnitude, (0, 0, 0, pad_bins, 0, 0))
+            phase_padded = torch.nn.functional.pad(phase, (0, 0, 0, pad_bins, 0, 0))
+        else:
+            phase_padded = phase
 
-        # Ensure same length as input
-        if output.shape[1] > audio_np.shape[1]:
-            output = output[:, :audio_np.shape[1]]
-        elif output.shape[1] < audio_np.shape[1]:
-            # Pad if output is shorter
-            pad_amount = audio_np.shape[1] - output.shape[1]
-            output = np.pad(output, ((0, 0), (0, pad_amount)), mode='constant')
+        masked_stft = output_magnitude * torch.exp(1j * phase_padded)
 
-        return output
+        # Use torch istft
+        output_audio = torch.istft(
+            masked_stft,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window,
+            center=True,
+            length=audio_tensor.shape[1]
+        )
+
+        # Convert back to numpy
+        output_np = output_audio.numpy()
+
+        # Ensure same shape as input
+        if output_np.shape != audio_np.shape:
+            if output_np.shape[0] != audio_np.shape[0]:
+                output_np = output_np[:audio_np.shape[0]]
+            if output_np.shape[1] != audio_np.shape[1]:
+                if output_np.shape[1] > audio_np.shape[1]:
+                    output_np = output_np[:, :audio_np.shape[1]]
+                else:
+                    pad = audio_np.shape[1] - output_np.shape[1]
+                    output_np = np.pad(output_np, ((0, 0), (0, pad)))
+
+        return output_np
 
     def _extract_instrument_stems(self, instrumental: torch.Tensor, sr: int,
                                   original: torch.Tensor) -> Dict:

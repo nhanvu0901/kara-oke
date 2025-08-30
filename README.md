@@ -33,3 +33,5 @@ UVR_MDXNET_KARA_2.onnx (50MB)
 Purpose: Karaoke-optimized (remove vocals, keep instruments)
 Best at: Preserving instrumental quality
 Focus: Clean instrumental output for karaoke
+
+frequency filtering
