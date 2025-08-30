@@ -35,12 +35,14 @@ def create_default_config() -> Dict[str, Any]:
         },
         "uvr5": {
             "model": "UVR-MDX-NET-Inst_HQ_3",
-            "chunk_size": 524288,  # Larger for better quality
-            "overlap": 0.75,  # Higher overlap for smoother results
-            "margin": 88200,  # 2 seconds margin
+            "chunk_size": 524288,
+            "overlap": 0.75,
+            "margin": 88200,
             "denoise": True,
             "post_process": True,
-            "tta": True,  # Test-time augmentation for quality
+            "tta": True,
+            "separation_mode": "enhanced",  # Add this
+            "target_instruments": ["drums", "bass", "piano", "guitar", "strings", "other"]
         }
     }
 
